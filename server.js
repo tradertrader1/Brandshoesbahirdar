@@ -52,7 +52,10 @@ async function initDb(){
    ["Nike Air Force 1 Triple White","Nike",1350,1550,"39,40,41,42,43,44",3,"Air Force 1",""],
    ["Nike Air Force 1 Black/White","Nike",1280,1480,"40,41,42,43",4,"Air Force 1",""]
   ];
-  for(const p of demo) await q(`INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,p);
+  for(const p of demo){
+   if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,p);
+   else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES(?,?,?,?,?,?,?,?)").run(...p);
+  }
  }
 }
 
