@@ -1,0 +1,6 @@
+Render build fix:
+The original project allowed any Node >=20, so Render selected a newer Node release.
+This version pins Node 20.19.0 for compatibility with the included better-sqlite3 dependency.
+
+After replacing the files in GitHub, redeploy the service on Render.
+If Render offers "Clear build cache & deploy", use it once.

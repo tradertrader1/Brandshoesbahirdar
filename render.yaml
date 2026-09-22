@@ -7,3 +7,6 @@ services:
     startCommand: npm start
     healthCheckPath: /
     autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20.19.0"
