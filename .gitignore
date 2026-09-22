@@ -4,6 +4,5 @@ node_modules/
 *.sqlite3
 .env
 .env.*
-.DS_Store
 uploads/*
 !uploads/.gitkeep

@@ -1,22 +1,42 @@
-# Shoe Store PRO
+# Brand Shoes — Real Store
 
-A real multi-customer shoe shop starter: shared SQLite inventory, product photo uploads, customer checkout, automatic stock decrement, order database and password-protected admin API.
+This version is prepared for GitHub + Render and includes:
+- ETB pricing
+- Responsive customer storefront
+- Product search and category filter
+- Size selection
+- Cart and checkout
+- Stock decrement when orders are placed
+- Admin product/stock management
+- Admin order management
+- WhatsApp order confirmation link
+- PostgreSQL support when `DATABASE_URL` is configured
+- SQLite fallback for testing
+- Optional Cloudinary image storage for permanent product photos
 
-## Run locally
-1. Install Node.js 18+.
-2. In this folder run `npm install`.
-3. Set an admin password:
-   - Windows PowerShell: `$env:ADMIN_PASS="your-strong-password"`
-   - macOS/Linux: `export ADMIN_PASS="your-strong-password"`
-4. Run `npm start`.
-5. Open `http://localhost:3000`.
+## Render Environment Variables
 
-Default username is `admin`. Change `ADMIN_USER` too for production.
+Set these in Render → Settings → Environment:
 
-## Production
-Use HTTPS, a strong admin password, persistent storage, regular database backups, and a managed database/image service before public launch. For multiple server instances, replace SQLite with PostgreSQL.
+ADMIN_USER=your-admin-username
+ADMIN_PASS=use-a-strong-password
+STORE_NAME=BRAND SHOES BAHIRDAR
+CURRENCY=ETB
+251945306592=2519XXXXXXXX
 
-Payment gateways and WhatsApp notifications should be connected using the provider credentials appropriate to your country. Never place secret API keys in browser JavaScript.
+For a persistent production database, add a Render PostgreSQL database and set:
+DATABASE_URL=<Render PostgreSQL connection string>
 
-## Demo stock
-On a fresh database, the app automatically seeds 5 sample Nike Air Force 1 listings in white/black variants with sample USD prices.
+For permanent uploaded product images, create a Cloudinary account and set:
+CLOUDINARY_CLOUD_NAME=...
+CLOUDINARY_API_KEY=...
+CLOUDINARY_API_SECRET=...
+
+If Cloudinary is not configured, uploads are saved locally (fine for testing, not recommended for permanent production storage).
+
+## Deployment
+
+Push the files to GitHub. Render should auto-deploy from the connected repository.
+
+Build: npm install
+Start: npm start

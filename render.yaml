@@ -1,12 +1,9 @@
 services:
   - type: web
-    name: shoe-store
+    name: brand-shoes-bahirdar
     runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
-    healthCheckPath: /
+    healthCheckPath: /api/health
     autoDeploy: true
-    envVars:
-      - key: NODE_VERSION
-        value: "20.19.0"

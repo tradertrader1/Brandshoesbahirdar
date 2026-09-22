@@ -1,0 +1,4 @@
+WhatsApp ordering is configured for the business number:
++251 945 306 592
+
+If you later change the business number, update the WhatsApp configuration in the app/server environment as documented in README.md.
