@@ -11,7 +11,7 @@ const app=express();
 const PORT=process.env.PORT||3000;
 const STORE_NAME=process.env.STORE_NAME||"BRAND SHOES BAHIRDAR";
 const CURRENCY=process.env.CURRENCY||"ETB";
-const WHATSAPP=String(process.env.251945306592||"").replace(/\D/g,"");
+const WHATSAPP=String(process.env.WHATSAPP_NUMBER||"251945306592").replace(/\D/g,"");
 const ADMIN_USER=process.env.ADMIN_USER||"admin";
 const ADMIN_PASS=process.env.ADMIN_PASS||"change-this-password";
 
