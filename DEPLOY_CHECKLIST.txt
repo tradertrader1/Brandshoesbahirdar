@@ -1,0 +1,10 @@
+GitHub + Render checklist
+
+1. Create a new GitHub repository.
+2. Upload all files from this package.
+3. On Render, choose New > Web Service.
+4. Connect the GitHub repository.
+5. Build Command: npm install
+6. Start Command: npm start
+7. Deploy.
+8. Open the Render URL.
