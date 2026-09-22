@@ -1,0 +1,3 @@
+Your GitHub repository has index.html at the repository root (not inside public/).
+This version of server.js is adjusted for that exact structure.
+Upload/replace server.js in GitHub, then redeploy on Render.
