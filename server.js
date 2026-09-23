@@ -22,7 +22,7 @@ const schema=`
 CREATE TABLE IF NOT EXISTS products(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
  name TEXT NOT NULL, brand TEXT DEFAULT '', price REAL NOT NULL,
- old_price REAL, sizes TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0, size_stock TEXT DEFAULT '{}',
+ old_price REAL, sizes TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0, size_stock TEXT DEFAULT '{}', colors TEXT DEFAULT '', color_stock TEXT DEFAULT '{}',
  category TEXT DEFAULT 'Shoes', image TEXT DEFAULT '',
  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -48,8 +48,8 @@ async function initDb(){
  else { db.exec(schema.replace(/INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY/g,"INTEGER PRIMARY KEY AUTOINCREMENT")); }
  // Per-size inventory migration for existing stores.
  try {
-  if(usePg) await pgPool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT '{}'");
-  else { try { db.exec("ALTER TABLE products ADD COLUMN size_stock TEXT DEFAULT '{}'"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; } }
+  if(usePg) await pgPool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT '{}'; ALTER TABLE products ADD COLUMN IF NOT EXISTS colors TEXT DEFAULT ''; ALTER TABLE products ADD COLUMN IF NOT EXISTS color_stock TEXT DEFAULT '{}'");
+  else { try { db.exec("ALTER TABLE products ADD COLUMN size_stock TEXT DEFAULT '{}'"); try { db.exec("ALTER TABLE products ADD COLUMN colors TEXT DEFAULT ''"); } catch(e) { if(!String(e.message).includes('duplicate column')) throw e; } try { db.exec("ALTER TABLE products ADD COLUMN color_stock TEXT DEFAULT '{}'"); } catch(e) { if(!String(e.message).includes('duplicate column')) throw e; } } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; } }
   const oldProducts=await q("SELECT id,sizes,stock,size_stock FROM products");
   for(const p of oldProducts.rows){
    let current={}; try { current=JSON.parse(p.size_stock||"{}"); } catch(e) {}
@@ -73,9 +73,9 @@ async function initDb(){
   for(const p of demo){
    const sizes=p[4].split(","), base=Math.floor(p[5]/sizes.length), rem=p[5]%sizes.length;
    const sizeStock=Object.fromEntries(sizes.map((z,i)=>[z,base+(i<rem?1:0)]));
-   const vals=[...p.slice(0,5),p[5],JSON.stringify(sizeStock),p[6],p[7]];
-   if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,vals);
-   else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?)").run(...vals);
+   const vals=[...p.slice(0,5),p[5],JSON.stringify(sizeStock),"","{}",p[6],p[7]];
+   if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,vals);
+   else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(...vals);
   }
  }
  const existingWhatsApp=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
@@ -209,23 +209,29 @@ app.post("/api/products",auth,upload.single("image"),async(req,res)=>{
   const p=req.body;if(!p.name||p.price===undefined)return res.status(400).json({error:"Name and price are required"});
   const image=await imgUrl(req,req.file);
   const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean);
+  const colors=[...new Set(String(p.colors||"").split(",").map(x=>x.trim()).filter(Boolean))];
   let sizeStock={}; try{sizeStock=JSON.parse(p.size_stock||"{}")}catch(e){}
   const normalized={}; for(const z of sizes){const n=Number(sizeStock[z]||0); normalized[z]=Number.isFinite(n)?Math.max(0,n):0;}
+  let colorStock={}; try{colorStock=JSON.parse(p.color_stock||"{}")}catch(e){} const normalizedColors={}; for(const c of colors){const n=Number(colorStock[c]||0); normalizedColors[c]=Number.isFinite(n)?Math.max(0,n):0;}
   const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
   if(!sizes.length || stock<1)return res.status(400).json({error:"Add at least one size and a quantity for that size."});
-  const vals=[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),p.category||"Shoes",image];
-  if(usePg){const r=await pgPool.query("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",vals);return res.json({id:r.rows[0].id});}
-  const r=db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?)").run(...vals);res.json({id:r.lastInsertRowid});
+  const vals=[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),p.category||"Shoes",image];
+  if(usePg){const r=await pgPool.query("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id",vals);return res.json({id:r.rows[0].id});}
+  const r=db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(...vals);res.json({id:r.lastInsertRowid});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/products/:id",auth,upload.single("image"),async(req,res)=>{
  try{
   const old=await one("SELECT * FROM products WHERE id=?",[req.params.id]);if(!old)return res.sendStatus(404);
   const p=req.body,image=req.file?await imgUrl(req,req.file):old.image;
-  const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean); let sizeStock={}; try{sizeStock=JSON.parse(p.size_stock||"{}")}catch(e){}
+  const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean);
+  const colors=[...new Set(String(p.colors||"").split(",").map(x=>x.trim()).filter(Boolean))];
+  let sizeStock={}; try{sizeStock=JSON.parse(p.size_stock||"{}")}catch(e){}
+  let colorStock={}; try{colorStock=JSON.parse(p.color_stock||"{}")}catch(e){}
   const normalized={}; for(const z of sizes){normalized[z]=Math.max(0,Number(sizeStock[z]||0));}
+  const normalizedColors={}; for(const c of colors){const n=Number(colorStock[c]||0); normalizedColors[c]=Number.isFinite(n)?Math.max(0,n):0;}
   const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
-  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,size_stock=?,category=?,image=? WHERE id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),p.category||"Shoes",image,req.params.id]);res.sendStatus(204);
+  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,size_stock=?,colors=?,color_stock=?,category=?,image=? WHERE id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),p.category||"Shoes",image,req.params.id]);res.sendStatus(204);
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.delete("/api/products/:id",auth,async(req,res)=>{await run("DELETE FROM products WHERE id=?",[req.params.id]);res.sendStatus(204)});
@@ -252,18 +258,21 @@ app.post("/api/orders",async(req,res)=>{
   const discount=couponApplied?subtotal*(configuredPercent/100):0;
   const total=Math.max(0,subtotal-discount+deliveryFee);
   for(const i of items){
-   const p=await one("SELECT stock,name,price,size_stock FROM products WHERE id=?",[i.id]);
+   const p=await one("SELECT stock,name,price,size_stock,colors,color_stock FROM products WHERE id=?",[i.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
    let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
    const size=String(i.size||"").trim(), available=Object.prototype.hasOwnProperty.call(ss,size)?Number(ss[size]):0;
+   let cs={}; try{cs=JSON.parse(p.color_stock||"{}")}catch(e){}
+   const color=String(i.color||"").trim(), colorList=String(p.colors||"").split(",").map(x=>x.trim()).filter(Boolean), colorAvailable=colorList.length?(Object.prototype.hasOwnProperty.call(cs,color)?Number(cs[color]):0):Infinity;
    if(!size || available<Number(i.qty))return res.status(409).json({error:`Not enough stock for ${p.name} in size ${size||"selected size"}. Only ${Math.max(0,available)} available.`});
+   if(colorList.length && (!color || colorAvailable<Number(i.qty)))return res.status(409).json({error:`Not enough stock for ${p.name} in color ${color||"selected color"}. Only ${Math.max(0,colorAvailable)} available.`});
   }
   let orderId;
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),total]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),total).lastInsertRowid;
   let wa="";
   if(WHATSAPP){
-   const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}`).join("\n");
+   const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}${i.color?` color ${i.color}`:""}`).join("\n");
    wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${CURRENCY} ${subtotal.toFixed(2)}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${CURRENCY} ${discount.toFixed(2)}`:""}\nDelivery: ${CURRENCY} ${deliveryFee.toFixed(2)}\nTotal: ${CURRENCY} ${total.toFixed(2)}`)}`;
   }
   res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total});
@@ -281,17 +290,21 @@ app.patch("/api/orders/:id",auth,async(req,res)=>{
    if(!Array.isArray(items)||!items.length)return res.status(400).json({error:"This order has no items."});
    // Check every requested size again at confirmation time. Stock is reserved/decremented only here.
    for(const i of items){
-    const p=await one("SELECT name,size_stock FROM products WHERE id=?",[i.id]);
+    const p=await one("SELECT name,size_stock,colors,color_stock FROM products WHERE id=?",[i.id]);
     if(!p)return res.status(409).json({error:`Product #${i.id} is no longer available.`});
     let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
     const size=String(i.size||"").trim(), available=Number(ss[size]||0), wanted=Number(i.qty||0);
+    let cs={}; try{cs=JSON.parse(p.color_stock||"{}")}catch(e){} const color=String(i.color||"").trim(), colorList=String(p.colors||"").split(",").map(x=>x.trim()).filter(Boolean), colorAvailable=colorList.length?(Number(cs[color]||0)):Infinity;
     if(!size || wanted<1 || available<wanted)return res.status(409).json({error:`Cannot confirm: ${p.name} size ${size||"selected size"} has only ${Math.max(0,available)} available.`});
+    if(colorList.length && (!color || colorAvailable<wanted)){}
+    if(colorList.length && (!color || colorAvailable<wanted))return res.status(409).json({error:`Cannot confirm: ${p.name} color ${color||"selected color"} has only ${Math.max(0,colorAvailable)} available.`});
    }
    for(const i of items){
-    const p=await one("SELECT size_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
+    const p=await one("SELECT size_stock,color_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){} let cs={}; try{cs=JSON.parse(p.color_stock||"{}")}catch(e){}
     ss[i.size]=Math.max(0,Number(ss[i.size]||0)-Number(i.qty));
+    if(i.color && Object.prototype.hasOwnProperty.call(cs,i.color)) cs[i.color]=Math.max(0,Number(cs[i.color]||0)-Number(i.qty));
     const remaining=Object.values(ss).reduce((a,b)=>a+Number(b||0),0);
-    await run("UPDATE products SET stock=?,size_stock=? WHERE id=?",[remaining,JSON.stringify(ss),i.id]);
+    await run("UPDATE products SET stock=?,size_stock=?,color_stock=? WHERE id=?",[remaining,JSON.stringify(ss),JSON.stringify(cs),i.id]);
    }
   }
   if(next==="DELIVERED" && current!=="CONFIRMED" && current!=="DELIVERED")return res.status(400).json({error:"Confirm the order before marking it delivered."});

@@ -52,3 +52,6 @@ Stock is reduced only when an Admin clicks **Confirm order** in Admin → Orders
 
 ## Discount Coupon
 Admin → Settings lets you set one active coupon code and its discount percentage. Customers enter the code in the cart and the server validates it before applying the discount. The discount is calculated from the product subtotal; delivery is added after the discount.
+
+## Color inventory
+Products can now have available colors with separate quantities, just like sizes. Customers must select a color when a product has colors. Sold-out colors are disabled. The selected color is stored in the order, shown in WhatsApp details, and color inventory is decremented only when the admin confirms the order.
