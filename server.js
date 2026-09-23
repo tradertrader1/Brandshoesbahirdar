@@ -187,11 +187,6 @@ app.post("/api/orders",async(req,res)=>{
    const size=String(i.size||"").trim(), available=Object.prototype.hasOwnProperty.call(ss,size)?Number(ss[size]):0;
    if(!size || available<Number(i.qty))return res.status(409).json({error:`Not enough stock for ${p.name} in size ${size||"selected size"}. Only ${Math.max(0,available)} available.`});
   }
-  for(const i of items){
-   const p=await one("SELECT size_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
-   ss[i.size]=Math.max(0,Number(ss[i.size]||0)-Number(i.qty)); const remaining=Object.values(ss).reduce((a,b)=>a+Number(b||0),0);
-   await run("UPDATE products SET stock=?,size_stock=? WHERE id=?",[remaining,JSON.stringify(ss),i.id]);
-  }
   let orderId;
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0).lastInsertRowid;
@@ -204,7 +199,35 @@ app.post("/api/orders",async(req,res)=>{
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
-app.patch("/api/orders/:id",auth,async(req,res)=>{await run("UPDATE orders SET status=? WHERE id=?",[req.body.status,req.params.id]);res.sendStatus(204)});
+app.patch("/api/orders/:id",auth,async(req,res)=>{
+ try{
+  const next=String(req.body.status||"").toUpperCase();
+  const order=await one("SELECT id,status,items FROM orders WHERE id=?",[req.params.id]);
+  if(!order)return res.status(404).json({error:"Order not found."});
+  const current=String(order.status||"NEW").toUpperCase();
+  if(next==="CONFIRMED" && current!=="CONFIRMED"){
+   let items=[]; try{items=JSON.parse(order.items||"[]")}catch(e){}
+   if(!Array.isArray(items)||!items.length)return res.status(400).json({error:"This order has no items."});
+   // Check every requested size again at confirmation time. Stock is reserved/decremented only here.
+   for(const i of items){
+    const p=await one("SELECT name,size_stock FROM products WHERE id=?",[i.id]);
+    if(!p)return res.status(409).json({error:`Product #${i.id} is no longer available.`});
+    let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
+    const size=String(i.size||"").trim(), available=Number(ss[size]||0), wanted=Number(i.qty||0);
+    if(!size || wanted<1 || available<wanted)return res.status(409).json({error:`Cannot confirm: ${p.name} size ${size||"selected size"} has only ${Math.max(0,available)} available.`});
+   }
+   for(const i of items){
+    const p=await one("SELECT size_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
+    ss[i.size]=Math.max(0,Number(ss[i.size]||0)-Number(i.qty));
+    const remaining=Object.values(ss).reduce((a,b)=>a+Number(b||0),0);
+    await run("UPDATE products SET stock=?,size_stock=? WHERE id=?",[remaining,JSON.stringify(ss),i.id]);
+   }
+  }
+  if(next==="DELIVERED" && current!=="CONFIRMED" && current!=="DELIVERED")return res.status(400).json({error:"Confirm the order before marking it delivered."});
+  await run("UPDATE orders SET status=? WHERE id=?",[next,req.params.id]);
+  res.json({ok:true,status:next});
+ }catch(e){res.status(500).json({error:e.message})}
+});
 
 app.get("/api/health",async(req,res)=>{try{await one("SELECT 1 AS ok");res.json({ok:true,db:usePg?"postgres":"sqlite"})}catch(e){res.status(500).json({ok:false,error:e.message})}});
 

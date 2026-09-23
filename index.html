@@ -45,27 +45,30 @@ async function loadAdmin(type){
  }else if(type==="orders"){
   let r=await fetch("/api/orders",{headers:headers()});if(!r.ok)return alert("Admin login failed. Check username/password.");
   let os=await r.json();
-  $("adminContent").innerHTML=os.map(o=>`<div class="order"><b>Order #${o.id}</b> — ${esc(o.customer)} — ${esc(o.phone)}<br>${esc(o.address)}<br><b>${money(o.total)}</b><br><span class="status ${esc(o.status)}">${esc(o.status)}</span> <button class="btn" onclick="setStatus(${o.id},'CONFIRMED')">Confirm</button> <button class="btn" onclick="setStatus(${o.id},'DELIVERED')">Delivered</button><details><summary>Order items</summary><pre>${esc(o.items)}</pre></details></div>`).join("")||'<p class="muted">No orders yet.</p>';
+  $("adminContent").innerHTML=os.map(o=>`<div class="order"><b>Order #${o.id}</b> — ${esc(o.customer)} — ${esc(o.phone)}<br>${esc(o.address)}<br><b>${money(o.total)}</b><br><span class="status ${esc(o.status)}">${esc(o.status)}</span> ${o.status==='NEW'?`<button class="btn dark" onclick="setStatus(${o.id},'CONFIRMED')">Confirm order</button>`:o.status==='CONFIRMED'?`<button class="btn" onclick="setStatus(${o.id},'DELIVERED')">Delivered</button>`:''}<details><summary>Order items</summary><pre>${esc(o.items)}</pre></details></div>`).join("")||'<p class="muted">No orders yet.</p>';
  }else if(type==="settings"){
   let r=await fetch("/api/config");let c=await r.json();
-  $("adminContent").innerHTML=`<h3>Store Settings</h3><p class="muted">Change the WhatsApp number customers use to send their orders. Enter it with country code, without + or spaces.</p><form class="form" id="settingsForm"><label><b>WhatsApp number</b></label><input id="waNumber" name="whatsapp" value="${esc(c.whatsapp||"")}" inputmode="numeric" placeholder="251945306592" required><button class="btn dark">Save WhatsApp number</button></form><div class="notice">Current number: <b>+${esc(c.whatsapp||"")}</b></div>`;
+  $("adminContent").innerHTML=`<h3>Store Settings</h3><p class="muted">Change the WhatsApp number and the delivery price customers see in the cart.</p><form class="form" id="settingsForm"><label><b>WhatsApp number</b></label><input id="waNumber" name="whatsapp" value="${esc(c.whatsapp||"")}" inputmode="numeric" placeholder="251945306592" required><label><b>Delivery price (ETB)</b></label><input id="deliveryFee" name="deliveryFee" type="number" min="0" step="0.01" value="${esc(c.deliveryFee??0)}" required><button class="btn dark">Save Settings</button></form><div class="notice">Current WhatsApp: <b>+${esc(c.whatsapp||"")}</b><br>Current delivery price: <b>${money(c.deliveryFee||0)}</b></div>`;
   $("settingsForm").onsubmit=saveSettings;
  }
 }
 async function saveSettings(e){
  e.preventDefault();
- let number=$("waNumber").value.trim();
+ let number=$("waNumber").value.trim(), fee=Number($("deliveryFee").value);
  let r=await fetch("/api/settings/whatsapp",{method:"PUT",headers:{...headers(),"Content-Type":"application/json"},body:JSON.stringify({whatsapp:number})});
  let j=await r.json().catch(()=>({}));
  if(!r.ok)return alert(j.error||"Could not save WhatsApp number.");
- config.whatsapp=j.whatsapp;
- $("adminContent").insertAdjacentHTML("beforeend",`<div class="notice">Saved. Customers will now send orders to <b>+${esc(j.whatsapp)}</b>.</div>`);
+ let d=await fetch("/api/settings/delivery",{method:"PUT",headers:{...headers(),"Content-Type":"application/json"},body:JSON.stringify({deliveryFee:fee})});
+ let dj=await d.json().catch(()=>({}));
+ if(!d.ok)return alert(dj.error||"Could not save delivery price.");
+ config.whatsapp=j.whatsapp;config.deliveryFee=dj.deliveryFee;
+ $("adminContent").insertAdjacentHTML("beforeend",`<div class="notice">Saved. WhatsApp: <b>+${esc(j.whatsapp)}</b> • Delivery: <b>${money(dj.deliveryFee)}</b></div>`);
 }
 function formatSizeStock(p){let ss=getSizeStock(p);return Object.entries(ss).map(([z,n])=>z+": "+n).join(" • ")}
 function buildSizeStock(){let sizes=[...new Set($("newSizes").value.split(",").map(x=>x.trim()).filter(Boolean))];if(!sizes.length)return alert("Enter sizes first, for example: 39,40,41,42");let old={};document.querySelectorAll("#sizeStockEditor input[data-size]").forEach(i=>old[i.dataset.size]=i.value);$("sizeStockEditor").innerHTML=sizes.map(z=>`<label>Size <b>${esc(z)}</b><input type="number" min="0" step="1" data-size="${esc(z)}" value="${esc(old[z]||0)}" placeholder="pairs"></label>`).join("");updateSizeStockJson()}
 function updateSizeStockJson(){let obj={};document.querySelectorAll("#sizeStockEditor input[data-size]").forEach(i=>obj[i.dataset.size]=Math.max(0,Number(i.value||0)));$("sizeStockJson").value=JSON.stringify(obj)}
 async function addProduct(e){e.preventDefault();updateSizeStockJson();let obj=JSON.parse($("sizeStockJson").value||"{}");if(!Object.values(obj).some(n=>Number(n)>0))return alert("Enter at least 1 pair for one of the sizes.");let r=await fetch("/api/products",{method:"POST",headers:headers(),body:new FormData(e.target)});if(!r.ok)return alert("Admin login failed or product data is invalid.");e.target.reset();await loadAdmin("stock");await load()}
 async function del(id){if(!confirm("Delete this product?"))return;await fetch("/api/products/"+id,{method:"DELETE",headers:headers()});await loadAdmin("stock");await load()}
-async function setStatus(id,status){await fetch("/api/orders/"+id,{method:"PATCH",headers:{...headers(),"Content-Type":"application/json"},body:JSON.stringify({status})});loadAdmin("orders")}
+async function setStatus(id,status){let r=await fetch("/api/orders/"+id,{method:"PATCH",headers:{...headers(),"Content-Type":"application/json"},body:JSON.stringify({status})});let j=await r.json().catch(()=>({}));if(!r.ok)return alert(j.error||"Could not update order.");await loadAdmin("orders");await load()}
 load();
 </script></body></html>
