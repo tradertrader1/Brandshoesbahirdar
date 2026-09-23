@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS orders(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
  customer TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL,
  notes TEXT DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL,
- status TEXT DEFAULT 'NEW', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+ status TEXT DEFAULT 'NEW', admin_seen INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS settings(
  key TEXT PRIMARY KEY, value TEXT NOT NULL
@@ -46,6 +46,11 @@ if(usePg){
 async function initDb(){
  if(usePg){ await pgPool.query(schema); }
  else { db.exec(schema.replace(/INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY/g,"INTEGER PRIMARY KEY AUTOINCREMENT")); }
+ // Admin notification migration for existing stores.
+ try {
+  if(usePg) await pgPool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_seen INTEGER NOT NULL DEFAULT 0");
+  else { try { db.exec("ALTER TABLE orders ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; } }
+ } catch(e) { console.error("admin notification migration:",e.message); }
  // Per-size inventory migration for existing stores.
  try {
   if(usePg) await pgPool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT '{}'; ALTER TABLE products ADD COLUMN IF NOT EXISTS colors TEXT DEFAULT ''; ALTER TABLE products ADD COLUMN IF NOT EXISTS color_stock TEXT DEFAULT '{}'");
@@ -278,7 +283,9 @@ app.post("/api/orders",async(req,res)=>{
   res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total});
  }catch(e){res.status(500).json({error:e.message})}
 });
+app.get("/api/orders/notification-count",async(req,res)=>{try{let r=await q("SELECT COUNT(*) AS n FROM orders WHERE status=? AND admin_seen=0",["NEW"]);res.json({count:Number(r.rows[0].n||0)})}catch(e){res.status(500).json({error:e.message})}});
 app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/orders/mark-seen",auth,async(req,res)=>{try{await run("UPDATE orders SET admin_seen=1 WHERE status=? AND admin_seen=0",["NEW"]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 app.patch("/api/orders/:id",auth,async(req,res)=>{
  try{
   const next=String(req.body.status||"").toUpperCase();
