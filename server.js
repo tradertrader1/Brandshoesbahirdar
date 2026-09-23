@@ -14,6 +14,31 @@ const CURRENCY=process.env.CURRENCY||"ETB";
 const WHATSAPP=String(process.env.WHATSAPP_NUMBER||"251945306592").replace(/\D/g,"");
 const ADMIN_USER=process.env.ADMIN_USER||"admin";
 const ADMIN_PASS=process.env.ADMIN_PASS||"change-this-password";
+const SMS_API_KEY=String(process.env.SMS_API_KEY||"").trim();
+const SMS_ADMIN_PHONE=String(process.env.SMS_ADMIN_PHONE||"251945306592").replace(/\D/g,"");
+const SMS_ENABLED=Boolean(SMS_API_KEY && SMS_ADMIN_PHONE);
+
+async function sendAdminSMS(message){
+ if(!SMS_ENABLED){
+  console.log("SMS notification skipped: SMS_API_KEY or SMS_ADMIN_PHONE is not configured.");
+  return {sent:false,skipped:true};
+ }
+ try{
+  const response=await fetch("https://smsethiopia.com/api/sms/send",{
+   method:"POST",
+   headers:{"KEY":SMS_API_KEY,"Content-Type":"application/json"},
+   body:JSON.stringify({msisdn:SMS_ADMIN_PHONE,text:message})
+  });
+  const text=await response.text();
+  let data={}; try{data=JSON.parse(text)}catch(e){data={raw:text}}
+  if(!response.ok || data.status && String(data.status).toLowerCase()==="error") throw new Error(`SMSEthiopia HTTP ${response.status}: ${text}`);
+  console.log("Admin SMS sent:",data);
+  return {sent:true,data};
+ }catch(e){
+  console.error("Admin SMS notification failed:",e.message);
+  return {sent:false,error:e.message};
+ }
+}
 
 const usePg=!!process.env.DATABASE_URL;
 let db, pgPool;
@@ -275,6 +300,11 @@ app.post("/api/orders",async(req,res)=>{
   let orderId;
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),total]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),total).lastInsertRowid;
+  const smsItems=items.map(i=>`${i.qty}x ${i.name||"shoe"} (size ${i.size||"-"}${i.color?`, ${i.color}`:""})`).join("; ");
+  const smsText=`NEW BRAND SHOES ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${CURRENCY} ${total.toFixed(2)}. Items: ${smsItems}. Check Admin dashboard.`;
+  // SMS is a notification only: if the provider is temporarily unavailable, the customer's order still succeeds.
+  await sendAdminSMS(smsText);
+
   let wa="";
   if(WHATSAPP){
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}${i.color?` color ${i.color}`:""}`).join("\n");

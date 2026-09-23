@@ -55,3 +55,14 @@ Admin → Settings lets you set one active coupon code and its discount percenta
 
 ## Color inventory
 Products can now have available colors with separate quantities, just like sizes. Customers must select a color when a product has colors. Sold-out colors are disabled. The selected color is stored in the order, shown in WhatsApp details, and color inventory is decremented only when the admin confirms the order.
+
+
+## SMSEthiopia Admin SMS Notifications
+
+This version can send an SMS to the store admin whenever a new customer order is placed. The SMS uses SMSEthiopia's REST API.
+
+Add these environment variables in Render: 
+- `SMS_API_KEY` = your private SMSEthiopia API key
+- `SMS_ADMIN_PHONE` = admin phone in international format, for example `251945306592`
+
+The API key must stay in Render Environment Variables and must not be put in `index.html` or committed to GitHub. If SMS sending fails, the order is still saved normally and the Admin red-dot notification still works.

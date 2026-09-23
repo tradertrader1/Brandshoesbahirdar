@@ -1,0 +1,15 @@
+BRAND SHOES - SMSETHIOPIA SMS SETUP
+
+In Render -> your Brand Shoes service -> Environment Variables, add:
+
+SMS_API_KEY=YOUR_PRIVATE_SMSETHIOPIA_API_KEY
+SMS_ADMIN_PHONE=251945306592
+
+Do not put the API key in GitHub or in index.html.
+
+When a customer places an order, Brand Shoes saves the order first, keeps the Admin red-dot notification, and then sends an SMS notification to SMS_ADMIN_PHONE using SMSEthiopia.
+
+SMSEthiopia endpoint used by this version:
+POST https://smsethiopia.com/api/sms/send
+Header: KEY: YOUR_API_KEY
+JSON: {"msisdn":"251945306592","text":"..."}
