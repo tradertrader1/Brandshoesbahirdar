@@ -43,3 +43,8 @@ Start: npm start
 
 ## Per-size inventory
 When adding a product in Admin > Products / Stock, enter the available sizes and click **Set quantities**. Enter the number of pairs for each size. Customers must select a size before adding to cart, and checkout decrements inventory for the exact size sold. Sold-out sizes are disabled automatically.
+
+## Stock confirmation behavior
+Customers can place orders normally. Placing an order does NOT reduce product or size stock. The product page continues to show the same available quantity while an order is NEW/pending.
+
+Stock is reduced only when an Admin clicks **Confirm order** in Admin → Orders. The server re-checks each exact product size at confirmation time and then decrements only those confirmed quantities. If there is insufficient stock at confirmation, the order remains unconfirmed and no stock is changed.
