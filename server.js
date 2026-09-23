@@ -82,6 +82,10 @@ async function initDb(){
  if(!existingWhatsApp){
   await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",WHATSAPP]);
  }
+ const existingDelivery=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
+ if(!existingDelivery){
+  await run("INSERT INTO settings(key,value) VALUES(?,?)",["delivery_fee","0"]);
+ }
 }
 
 async function q(sql,params=[]){
@@ -136,7 +140,8 @@ function imgUrl(req,file){
 app.get("/api/config",async(req,res)=>{
  try{
   const w=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
-  res.json({storeName:STORE_NAME,currency:CURRENCY,whatsapp:(w&&w.value)||WHATSAPP});
+  const d=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
+  res.json({storeName:STORE_NAME,currency:CURRENCY,whatsapp:(w&&w.value)||WHATSAPP,deliveryFee:Math.max(0,Number(d&&d.value||0))});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/settings/whatsapp",auth,async(req,res)=>{
@@ -147,6 +152,16 @@ app.put("/api/settings/whatsapp",auth,async(req,res)=>{
   if(existing) await run("UPDATE settings SET value=? WHERE key=?",[number,"whatsapp"]);
   else await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",number]);
   res.json({ok:true,whatsapp:number});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.put("/api/settings/delivery",auth,async(req,res)=>{
+ try{
+  const fee=Number(req.body.deliveryFee);
+  if(!Number.isFinite(fee)||fee<0)return res.status(400).json({error:"Enter a valid delivery price of 0 or more."});
+  const existing=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
+  if(existing) await run("UPDATE settings SET value=? WHERE key=?",[String(fee),"delivery_fee"]);
+  else await run("INSERT INTO settings(key,value) VALUES(?,?)",["delivery_fee",String(fee)]);
+  res.json({ok:true,deliveryFee:fee});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/products",async(req,res)=>{try{let r=await q("SELECT * FROM products ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
@@ -178,8 +193,17 @@ app.delete("/api/products/:id",auth,async(req,res)=>{await run("DELETE FROM prod
 
 app.post("/api/orders",async(req,res)=>{
  try{
-  const {customer,phone,address,notes,items,total}=req.body;
+  const {customer,phone,address,notes,items}=req.body;
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
+  const deliverySetting=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
+  const deliveryFee=Math.max(0,Number(deliverySetting&&deliverySetting.value||0));
+  let subtotal=0;
+  for(const i of items){
+   const p=await one("SELECT price FROM products WHERE id=?",[i.id]);
+   if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
+   subtotal += Number(p.price||0)*Number(i.qty||0);
+  }
+  const total=subtotal+deliveryFee;
   for(const i of items){
    const p=await one("SELECT stock,name,price,size_stock FROM products WHERE id=?",[i.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
@@ -188,14 +212,14 @@ app.post("/api/orders",async(req,res)=>{
    if(!size || available<Number(i.qty))return res.status(409).json({error:`Not enough stock for ${p.name} in size ${size||"selected size"}. Only ${Math.max(0,available)} available.`});
   }
   let orderId;
-  if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0]);orderId=r.rows[0].id}
-  else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0).lastInsertRowid;
+  if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),total]);orderId=r.rows[0].id}
+  else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),total).lastInsertRowid;
   let wa="";
   if(WHATSAPP){
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}`).join("\n");
-   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\\nName: ${customer}\\nPhone: ${phone}\\nAddress: ${address}\\nItems:\\n${lines}\\nTotal: ${CURRENCY} ${Number(total).toFixed(2)}`)}`;
+   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\\nName: ${customer}\\nPhone: ${phone}\\nAddress: ${address}\\nItems:\\n${lines}\\nSubtotal: ${CURRENCY} ${subtotal.toFixed(2)}\\nDelivery: ${CURRENCY} ${deliveryFee.toFixed(2)}\\nTotal: ${CURRENCY} ${total.toFixed(2)}`)}`;
   }
-  res.json({orderId,whatsapp:wa});
+  res.json({orderId,whatsapp:wa,subtotal,deliveryFee,total});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
