@@ -301,14 +301,14 @@ app.post("/api/orders",async(req,res)=>{
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),total]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),total).lastInsertRowid;
   const smsItems=items.map(i=>`${i.qty}x ${i.name||"shoe"} (size ${i.size||"-"}${i.color?`, ${i.color}`:""})`).join("; ");
-  const smsText=`NEW BRAND SHOES ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${CURRENCY} ${total.toFixed(2)}. Items: ${smsItems}. Check Admin dashboard.`;
+  const smsText=`NEW BRAND SHOES ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
   // SMS is a notification only: if the provider is temporarily unavailable, the customer's order still succeeds.
   await sendAdminSMS(smsText);
 
   let wa="";
   if(WHATSAPP){
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}${i.color?` color ${i.color}`:""}`).join("\n");
-   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${CURRENCY} ${subtotal.toFixed(2)}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${CURRENCY} ${discount.toFixed(2)}`:""}\nDelivery: ${CURRENCY} ${deliveryFee.toFixed(2)}\nTotal: ${CURRENCY} ${total.toFixed(2)}`)}`;
+   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${subtotal.toFixed(2)} ${CURRENCY}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${discount.toFixed(2)} ${CURRENCY}`:""}\nDelivery: ${deliveryFee.toFixed(2)} ${CURRENCY}\nTotal: ${total.toFixed(2)} ${CURRENCY}`)}`;
   }
   res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total});
  }catch(e){res.status(500).json({error:e.message})}
