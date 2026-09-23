@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS orders(
  customer TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL,
  notes TEXT DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL,
  status TEXT DEFAULT 'NEW', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS settings(
+ key TEXT PRIMARY KEY, value TEXT NOT NULL
 );`;
 
 if(usePg){
@@ -56,6 +59,10 @@ async function initDb(){
    if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,p);
    else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES(?,?,?,?,?,?,?,?)").run(...p);
   }
+ }
+ const existingWhatsApp=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
+ if(!existingWhatsApp){
+  await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",WHATSAPP]);
  }
 }
 
@@ -108,7 +115,22 @@ function imgUrl(req,file){
  return "/uploads/"+name;
 }
 
-app.get("/api/config",(req,res)=>res.json({storeName:STORE_NAME,currency:CURRENCY,whatsapp:WHATSAPP}));
+app.get("/api/config",async(req,res)=>{
+ try{
+  const w=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
+  res.json({storeName:STORE_NAME,currency:CURRENCY,whatsapp:(w&&w.value)||WHATSAPP});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.put("/api/settings/whatsapp",auth,async(req,res)=>{
+ try{
+  const number=String(req.body.whatsapp||"").replace(/\D/g,"");
+  if(number.length<8 || number.length>15)return res.status(400).json({error:"Enter a valid WhatsApp number in international format, e.g. 251945306592."});
+  const existing=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
+  if(existing) await run("UPDATE settings SET value=? WHERE key=?",[number,"whatsapp"]);
+  else await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",number]);
+  res.json({ok:true,whatsapp:number});
+ }catch(e){res.status(500).json({error:e.message})}
+});
 app.get("/api/products",async(req,res)=>{try{let r=await q("SELECT * FROM products ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/products",auth,upload.single("image"),async(req,res)=>{
  try{
