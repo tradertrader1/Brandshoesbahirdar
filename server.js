@@ -22,7 +22,7 @@ const schema=`
 CREATE TABLE IF NOT EXISTS products(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
  name TEXT NOT NULL, brand TEXT DEFAULT '', price REAL NOT NULL,
- old_price REAL, sizes TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0,
+ old_price REAL, sizes TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0, size_stock TEXT DEFAULT '{}',
  category TEXT DEFAULT 'Shoes', image TEXT DEFAULT '',
  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -46,6 +46,21 @@ if(usePg){
 async function initDb(){
  if(usePg){ await pgPool.query(schema); }
  else { db.exec(schema.replace(/INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY/g,"INTEGER PRIMARY KEY AUTOINCREMENT")); }
+ // Per-size inventory migration for existing stores.
+ try {
+  if(usePg) await pgPool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT '{}'");
+  else { try { db.exec("ALTER TABLE products ADD COLUMN size_stock TEXT DEFAULT '{}'"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; } }
+  const oldProducts=await q("SELECT id,sizes,stock,size_stock FROM products");
+  for(const p of oldProducts.rows){
+   let current={}; try { current=JSON.parse(p.size_stock||"{}"); } catch(e) {}
+   if(!current || Object.keys(current).length===0){
+    const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean);
+    const total=Math.max(0,Number(p.stock)||0), base=sizes.length?Math.floor(total/sizes.length):0, rem=sizes.length?total%sizes.length:0;
+    for(let i=0;i<sizes.length;i++) current[sizes[i]]=base+(i<rem?1:0);
+    await run("UPDATE products SET size_stock=? WHERE id=?",[JSON.stringify(current),p.id]);
+   }
+  }
+ } catch(e) { console.error("size inventory migration:",e.message); }
  const count=await q("SELECT COUNT(*) AS n FROM products");
  if(Number(count.rows?count.rows[0].n:count[0].n)===0){
   const demo=[
@@ -56,8 +71,11 @@ async function initDb(){
    ["Nike Air Force 1 Black/White","Nike",1280,1480,"40,41,42,43",4,"Air Force 1",""]
   ];
   for(const p of demo){
-   if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,p);
-   else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES(?,?,?,?,?,?,?,?)").run(...p);
+   const sizes=p[4].split(","), base=Math.floor(p[5]/sizes.length), rem=p[5]%sizes.length;
+   const sizeStock=Object.fromEntries(sizes.map((z,i)=>[z,base+(i<rem?1:0)]));
+   const vals=[...p.slice(0,5),p[5],JSON.stringify(sizeStock),p[6],p[7]];
+   if(usePg) await pgPool.query(`INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,vals);
+   else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?)").run(...vals);
   }
  }
  const existingWhatsApp=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
@@ -136,15 +154,24 @@ app.post("/api/products",auth,upload.single("image"),async(req,res)=>{
  try{
   const p=req.body;if(!p.name||p.price===undefined)return res.status(400).json({error:"Name and price are required"});
   const image=await imgUrl(req,req.file);
-  if(usePg){const r=await pgPool.query("INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",[p.name,p.brand||"",+p.price,+p.old_price||null,p.sizes||"",+p.stock||0,p.category||"Shoes",image]);return res.json({id:r.rows[0].id})}
-  const r=db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,category,image) VALUES(?,?,?,?,?,?,?,?)").run(p.name,p.brand||"",+p.price,+p.old_price||null,p.sizes||"",+p.stock||0,p.category||"Shoes",image);res.json({id:r.lastInsertRowid});
+  const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean);
+  let sizeStock={}; try{sizeStock=JSON.parse(p.size_stock||"{}")}catch(e){}
+  const normalized={}; for(const z of sizes){const n=Number(sizeStock[z]||0); normalized[z]=Number.isFinite(n)?Math.max(0,n):0;}
+  const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
+  if(!sizes.length || stock<1)return res.status(400).json({error:"Add at least one size and a quantity for that size."});
+  const vals=[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),p.category||"Shoes",image];
+  if(usePg){const r=await pgPool.query("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",vals);return res.json({id:r.rows[0].id});}
+  const r=db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,category,image) VALUES(?,?,?,?,?,?,?,?,?)").run(...vals);res.json({id:r.lastInsertRowid});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/products/:id",auth,upload.single("image"),async(req,res)=>{
  try{
   const old=await one("SELECT * FROM products WHERE id=?",[req.params.id]);if(!old)return res.sendStatus(404);
   const p=req.body,image=req.file?await imgUrl(req,req.file):old.image;
-  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,category=?,image=? WHERE id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,p.sizes||"",+p.stock||0,p.category||"Shoes",image,req.params.id]);res.sendStatus(204);
+  const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean); let sizeStock={}; try{sizeStock=JSON.parse(p.size_stock||"{}")}catch(e){}
+  const normalized={}; for(const z of sizes){normalized[z]=Math.max(0,Number(sizeStock[z]||0));}
+  const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
+  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,size_stock=?,category=?,image=? WHERE id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),p.category||"Shoes",image,req.params.id]);res.sendStatus(204);
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.delete("/api/products/:id",auth,async(req,res)=>{await run("DELETE FROM products WHERE id=?",[req.params.id]);res.sendStatus(204)});
@@ -153,8 +180,18 @@ app.post("/api/orders",async(req,res)=>{
  try{
   const {customer,phone,address,notes,items,total}=req.body;
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
-  for(const i of items){const p=await one("SELECT stock,name,price FROM products WHERE id=?",[i.id]);if(!p||Number(p.stock)<Number(i.qty))return res.status(409).json({error:`Not enough stock for ${p?p.name:"a product"}.`})}
-  for(const i of items)await run("UPDATE products SET stock=stock-? WHERE id=?",[Number(i.qty),i.id]);
+  for(const i of items){
+   const p=await one("SELECT stock,name,price,size_stock FROM products WHERE id=?",[i.id]);
+   if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
+   let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
+   const size=String(i.size||"").trim(), available=Object.prototype.hasOwnProperty.call(ss,size)?Number(ss[size]):0;
+   if(!size || available<Number(i.qty))return res.status(409).json({error:`Not enough stock for ${p.name} in size ${size||"selected size"}. Only ${Math.max(0,available)} available.`});
+  }
+  for(const i of items){
+   const p=await one("SELECT size_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
+   ss[i.size]=Math.max(0,Number(ss[i.size]||0)-Number(i.qty)); const remaining=Object.values(ss).reduce((a,b)=>a+Number(b||0),0);
+   await run("UPDATE products SET stock=?,size_stock=? WHERE id=?",[remaining,JSON.stringify(ss),i.id]);
+  }
   let orderId;
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),Number(total)||0).lastInsertRowid;

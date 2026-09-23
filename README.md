@@ -40,3 +40,6 @@ Push the files to GitHub. Render should auto-deploy from the connected repositor
 
 Build: npm install
 Start: npm start
+
+## Per-size inventory
+When adding a product in Admin > Products / Stock, enter the available sizes and click **Set quantities**. Enter the number of pairs for each size. Customers must select a size before adding to cart, and checkout decrements inventory for the exact size sold. Sold-out sizes are disabled automatically.
