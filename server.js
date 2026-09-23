@@ -86,6 +86,14 @@ async function initDb(){
  if(!existingDelivery){
   await run("INSERT INTO settings(key,value) VALUES(?,?)",["delivery_fee","0"]);
  }
+ const existingCouponCode=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
+ if(!existingCouponCode){
+  await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_code",""]);
+ }
+ const existingCouponPercent=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+ if(!existingCouponPercent){
+  await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent","0"]);
+ }
 }
 
 async function q(sql,params=[]){
@@ -164,6 +172,37 @@ app.put("/api/settings/delivery",auth,async(req,res)=>{
   res.json({ok:true,deliveryFee:fee});
  }catch(e){res.status(500).json({error:e.message})}
 });
+app.get("/api/coupon",async(req,res)=>{
+ try{
+  const entered=String(req.query.code||"").trim().toUpperCase();
+  const codeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
+  const percentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  const configured=String(codeRow&&codeRow.value||"").trim().toUpperCase();
+  const percent=Math.min(100,Math.max(0,Number(percentRow&&percentRow.value||0)));
+  if(!entered || !configured || percent<=0 || entered!==configured)return res.status(400).json({valid:false,error:"Invalid or expired discount coupon."});
+  res.json({valid:true,code:configured,percent});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.get("/api/settings/coupon",auth,async(req,res)=>{
+ try{
+  const codeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
+  const percentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  res.json({couponCode:String(codeRow&&codeRow.value||""),couponPercent:Math.min(100,Math.max(0,Number(percentRow&&percentRow.value||0)))});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.put("/api/settings/coupon",auth,async(req,res)=>{
+ try{
+  const code=String(req.body.couponCode||"").trim().toUpperCase().replace(/\s+/g,"");
+  const percent=Number(req.body.couponPercent);
+  if(code && !/^[A-Z0-9_-]{3,30}$/.test(code))return res.status(400).json({error:"Coupon code must be 3-30 letters, numbers, hyphens or underscores."});
+  if(!Number.isFinite(percent)||percent<0||percent>100)return res.status(400).json({error:"Discount percent must be between 0 and 100."});
+  const existingCode=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
+  const existingPercent=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  if(existingCode) await run("UPDATE settings SET value=? WHERE key=?",[code,"coupon_code"]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_code",code]);
+  if(existingPercent) await run("UPDATE settings SET value=? WHERE key=?",[String(percent),"coupon_percent"]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent",String(percent)]);
+  res.json({ok:true,couponCode:code,couponPercent:percent});
+ }catch(e){res.status(500).json({error:e.message})}
+});
 app.get("/api/products",async(req,res)=>{try{let r=await q("SELECT * FROM products ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/products",auth,upload.single("image"),async(req,res)=>{
  try{
@@ -197,13 +236,21 @@ app.post("/api/orders",async(req,res)=>{
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
   const deliverySetting=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
   const deliveryFee=Math.max(0,Number(deliverySetting&&deliverySetting.value||0));
+  const enteredCoupon=String(req.body.couponCode||"").trim().toUpperCase();
+  const couponCodeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
+  const couponPercentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  const configuredCoupon=String(couponCodeRow&&couponCodeRow.value||"").trim().toUpperCase();
+  const configuredPercent=Math.min(100,Math.max(0,Number(couponPercentRow&&couponPercentRow.value||0)));
+  const couponApplied=Boolean(enteredCoupon && configuredCoupon && enteredCoupon===configuredCoupon && configuredPercent>0);
+  if(enteredCoupon && !couponApplied)return res.status(400).json({error:"Invalid or expired discount coupon."});
   let subtotal=0;
   for(const i of items){
    const p=await one("SELECT price FROM products WHERE id=?",[i.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
    subtotal += Number(p.price||0)*Number(i.qty||0);
   }
-  const total=subtotal+deliveryFee;
+  const discount=couponApplied?subtotal*(configuredPercent/100):0;
+  const total=Math.max(0,subtotal-discount+deliveryFee);
   for(const i of items){
    const p=await one("SELECT stock,name,price,size_stock FROM products WHERE id=?",[i.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
@@ -217,9 +264,9 @@ app.post("/api/orders",async(req,res)=>{
   let wa="";
   if(WHATSAPP){
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}`).join("\n");
-   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\\nName: ${customer}\\nPhone: ${phone}\\nAddress: ${address}\\nItems:\\n${lines}\\nSubtotal: ${CURRENCY} ${subtotal.toFixed(2)}\\nDelivery: ${CURRENCY} ${deliveryFee.toFixed(2)}\\nTotal: ${CURRENCY} ${total.toFixed(2)}`)}`;
+   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${CURRENCY} ${subtotal.toFixed(2)}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${CURRENCY} ${discount.toFixed(2)}`:""}\nDelivery: ${CURRENCY} ${deliveryFee.toFixed(2)}\nTotal: ${CURRENCY} ${total.toFixed(2)}`)}`;
   }
-  res.json({orderId,whatsapp:wa,subtotal,deliveryFee,total});
+  res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});

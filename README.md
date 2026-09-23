@@ -48,3 +48,7 @@ When adding a product in Admin > Products / Stock, enter the available sizes and
 Customers can place orders normally. Placing an order does NOT reduce product or size stock. The product page continues to show the same available quantity while an order is NEW/pending.
 
 Stock is reduced only when an Admin clicks **Confirm order** in Admin → Orders. The server re-checks each exact product size at confirmation time and then decrements only those confirmed quantities. If there is insufficient stock at confirmation, the order remains unconfirmed and no stock is changed.
+
+
+## Discount Coupon
+Admin → Settings lets you set one active coupon code and its discount percentage. Customers enter the code in the cart and the server validates it before applying the discount. The discount is calculated from the product subtotal; delivery is added after the discount.
