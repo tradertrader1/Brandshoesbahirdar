@@ -188,7 +188,7 @@ async function initDb(){
  if(!existingCouponPercent){
   await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent","0"]);
  }
- const paymentDefaults={payment_telebirr:"",payment_bank:"",payment_mastercard_link:""};
+ const paymentDefaults={payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
  for(const [key,value] of Object.entries(paymentDefaults)){
   const row=await one("SELECT value FROM settings WHERE key=?",[key]);
   if(!row) await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);
@@ -313,26 +313,35 @@ app.put("/api/settings/coupon",auth,async(req,res)=>{
 });
 app.get("/api/payment-options",async(req,res)=>{
  try{
-  const rows=await q("SELECT key,value FROM settings WHERE key IN ('payment_telebirr','payment_bank','payment_mastercard_link')");
-  const out={telebirr:"",bank:"",mastercardLink:""};
-  for(const r of rows.rows){if(r.key==="payment_telebirr")out.telebirr=r.value||"";if(r.key==="payment_bank")out.bank=r.value||"";if(r.key==="payment_mastercard_link")out.mastercardLink=r.value||"";}
-  res.json(out);
+  const keys=["payment_telebirr","payment_telebirr_enabled","payment_telebirr_link","payment_bank","payment_bank_enabled","payment_bank_link","payment_mastercard_details","payment_mastercard_enabled","payment_mastercard_link"];
+  const rows=await q("SELECT key,value FROM settings WHERE key IN ("+keys.map(()=>"?").join(",")+")",keys);
+  const v={}; for(const r of rows.rows)v[r.key]=r.value||"";
+  res.json({telebirr:v.payment_telebirr||"",telebirrEnabled:v.payment_telebirr_enabled==="1",telebirrDetails:v.payment_telebirr||"",telebirrLink:v.payment_telebirr_link||"",bank:v.payment_bank||"",bankEnabled:v.payment_bank_enabled==="1",bankDetails:v.payment_bank||"",bankLink:v.payment_bank_link||"",mastercardDetails:v.payment_mastercard_details||"",mastercardEnabled:v.payment_mastercard_enabled==="1",mastercardLink:v.payment_mastercard_link||""});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/settings/payment",auth,async(req,res)=>{
  try{
-  const a=await one("SELECT value FROM settings WHERE key=?",["payment_telebirr"]),b=await one("SELECT value FROM settings WHERE key=?",["payment_bank"]),m=await one("SELECT value FROM settings WHERE key=?",["payment_mastercard_link"]);
-  res.json({telebirr:a?.value||"",bank:b?.value||"",mastercardLink:m?.value||""});
+  const keys=["payment_telebirr","payment_telebirr_enabled","payment_telebirr_link","payment_bank","payment_bank_enabled","payment_bank_link","payment_mastercard_details","payment_mastercard_enabled","payment_mastercard_link"];
+  const rows=await q("SELECT key,value FROM settings WHERE key IN ("+keys.map(()=>"?").join(",")+")",keys); const v={}; for(const r of rows.rows)v[r.key]=r.value||"";
+  res.json({telebirr:v.payment_telebirr||"",telebirrEnabled:v.payment_telebirr_enabled==="1",telebirrLink:v.payment_telebirr_link||"",bank:v.payment_bank||"",bankEnabled:v.payment_bank_enabled==="1",bankLink:v.payment_bank_link||"",mastercardDetails:v.payment_mastercard_details||"",mastercardEnabled:v.payment_mastercard_enabled==="1",mastercardLink:v.payment_mastercard_link||""});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/settings/payment",auth,async(req,res)=>{
  try{
-  const values={payment_telebirr:String(req.body.telebirr||"").trim(),payment_bank:String(req.body.bank||"").trim(),payment_mastercard_link:String(req.body.mastercardLink||"").trim()};
-  for(const [key,value] of Object.entries(values)){
-   const row=await one("SELECT value FROM settings WHERE key=?",[key]);
-   if(row) await run("UPDATE settings SET value=? WHERE key=?",[value,key]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);
-  }
-  res.json({ok:true,telebirr:values.payment_telebirr,bank:values.payment_bank,mastercardLink:values.payment_mastercard_link});
+  const values={payment_telebirr:String(req.body.telebirr||"").trim(),payment_telebirr_enabled:req.body.telebirrEnabled?"1":"0",payment_telebirr_link:String(req.body.telebirrLink||"").trim(),payment_bank:String(req.body.bank||"").trim(),payment_bank_enabled:req.body.bankEnabled?"1":"0",payment_bank_link:String(req.body.bankLink||"").trim(),payment_mastercard_details:String(req.body.mastercardDetails||"").trim(),payment_mastercard_enabled:req.body.mastercardEnabled?"1":"0",payment_mastercard_link:String(req.body.mastercardLink||"").trim()};
+  for(const [key,value] of Object.entries(values)){const row=await one("SELECT value FROM settings WHERE key=?",[key]);if(row) await run("UPDATE settings SET value=? WHERE key=?",[value,key]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);}
+  res.json({ok:true,telebirr:values.payment_telebirr,telebirrEnabled:values.payment_telebirr_enabled==="1",telebirrLink:values.payment_telebirr_link,bank:values.payment_bank,bankEnabled:values.payment_bank_enabled==="1",bankLink:values.payment_bank_link,mastercardDetails:values.payment_mastercard_details,mastercardEnabled:values.payment_mastercard_enabled==="1",mastercardLink:values.payment_mastercard_link});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.post("/api/payment/start",async(req,res)=>{
+ try{
+  const method=String(req.body.method||"").toUpperCase();
+  const map={MASTERCARD:{enabled:"payment_mastercard_enabled",link:"payment_mastercard_link",name:"Mastercard"},TELEBIRR:{enabled:"payment_telebirr_enabled",link:"payment_telebirr_link",name:"Telebirr"},BANK:{enabled:"payment_bank_enabled",link:"payment_bank_link",name:"Bank transfer"}};
+  const cfg=map[method]; if(!cfg)return res.status(400).json({error:"Choose Pay later or a configured payment method."});
+  const en=await one("SELECT value FROM settings WHERE key=?",[cfg.enabled]); if(String(en?.value||"")!=="1")return res.status(400).json({error:cfg.name+" is currently unavailable. Please choose Pay later or try another payment method."});
+  const link=await one("SELECT value FROM settings WHERE key=?",[cfg.link]);
+  if(!String(link?.value||"").trim())return res.status(400).json({error:cfg.name+" is enabled but its payment gateway/link has not been configured yet. Ask the admin to finish payment setup."});
+  res.json({ok:true,url:String(link.value).trim(),method});
  }catch(e){res.status(500).json({error:e.message})}
 });
 
@@ -433,6 +442,7 @@ app.post("/api/orders",async(req,res)=>{
   const paymentMethod=String(req.body.paymentMethod||"NONE").toUpperCase();
   const allowedPayments=["NONE","MASTERCARD","TELEBIRR","BANK"];
   if(!allowedPayments.includes(paymentMethod))return res.status(400).json({error:"Invalid payment method."});
+  if(paymentMethod!=="NONE")return res.status(402).json({error:"This order can only be created after verified payment. The live gateway confirmation is not connected yet. Choose Pay later to place the order without payment."});
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
   const deliverySetting=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
   const deliveryFee=Math.max(0,Number(deliverySetting&&deliverySetting.value||0));
