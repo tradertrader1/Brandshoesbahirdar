@@ -17,6 +17,11 @@ const ADMIN_PASS=process.env.ADMIN_PASS||"change-this-password";
 const SMS_API_KEY=String(process.env.SMS_API_KEY||"").trim();
 const SMS_ADMIN_PHONE=String(process.env.SMS_ADMIN_PHONE||"251945306592").replace(/\D/g,"");
 const SMS_ENABLED=Boolean(SMS_API_KEY && SMS_ADMIN_PHONE);
+const CUSTOMER_SESSION_DAYS=30;
+function hashPassword(password,salt){return crypto.scryptSync(String(password),salt,64).toString("hex");}
+function makePasswordHash(password){const salt=crypto.randomBytes(16).toString("hex");return `${salt}:${hashPassword(password,salt)}`;}
+function verifyPassword(password,stored){try{const [salt,hash]=String(stored||"").split(":");if(!salt||!hash)return false;const actual=hashPassword(password,salt);return crypto.timingSafeEqual(Buffer.from(actual,"hex"),Buffer.from(hash,"hex"));}catch(e){return false;}}
+function customerToken(){return crypto.randomBytes(32).toString("hex");}
 
 async function sendAdminSMS(message){
  if(!SMS_ENABLED){
@@ -59,6 +64,13 @@ CREATE TABLE IF NOT EXISTS orders(
 );
 CREATE TABLE IF NOT EXISTS settings(
  key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS customers(
+ id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
+ name TEXT NOT NULL, phone TEXT NOT NULL UNIQUE, email TEXT DEFAULT '', address TEXT DEFAULT '', password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS customer_sessions(
+ token TEXT PRIMARY KEY, customer_id INTEGER NOT NULL, expires_at TIMESTAMP NOT NULL
 );`;
 
 if(usePg){
@@ -283,6 +295,53 @@ app.put("/api/settings/coupon",auth,async(req,res)=>{
   if(existingPercent) await run("UPDATE settings SET value=? WHERE key=?",[String(percent),"coupon_percent"]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent",String(percent)]);
   res.json({ok:true,couponCode:code,couponPercent:percent});
  }catch(e){res.status(500).json({error:e.message})}
+});
+function customerFromRequest(req){
+ const token=String(req.headers["x-customer-token"]||req.cookies?.customer_token||"").trim();
+ if(!token)return null;
+ return token;
+}
+async function getCustomer(req){
+ const token=customerFromRequest(req);
+ if(!token)return null;
+ const row=await one("SELECT c.id,c.name,c.phone,c.email,c.address,s.token,s.expires_at FROM customer_sessions s JOIN customers c ON c.id=s.customer_id WHERE s.token=? AND s.expires_at>CURRENT_TIMESTAMP",[token]);
+ return row||null;
+}
+app.post("/api/customer/register",async(req,res)=>{
+ try{
+  const name=String(req.body.name||"").trim(),phone=String(req.body.phone||"").trim(),email=String(req.body.email||"").trim(),address=String(req.body.address||"").trim(),password=String(req.body.password||"");
+  if(name.length<2||phone.length<5||password.length<6)return res.status(400).json({error:"Please provide your name, a valid phone number, and a password of at least 6 characters."});
+  const existing=await one("SELECT id FROM customers WHERE phone=?",[phone]);
+  if(existing)return res.status(409).json({error:"An account with this phone number already exists. Please sign in."});
+  const ph=makePasswordHash(password);
+  let customer;
+  if(usePg){const r=await pgPool.query("INSERT INTO customers(name,phone,email,address,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,name,phone,email,address",[name,phone,email,address,ph]);customer=r.rows[0];}
+  else {const r=db.prepare("INSERT INTO customers(name,phone,email,address,password_hash) VALUES(?,?,?,?,?)").run(name,phone,email,address,ph);customer=await one("SELECT id,name,phone,email,address FROM customers WHERE id=?",[r.lastInsertRowid]);}
+  const token=customerToken();
+  await run(usePg?"INSERT INTO customer_sessions(token,customer_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO customer_sessions(token,customer_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,customer.id]);
+  res.json({token,customer});
+ }catch(e){
+  if(String(e.message).toLowerCase().includes("unique"))return res.status(409).json({error:"An account with this phone number already exists."});
+  res.status(500).json({error:e.message});
+ }
+});
+app.post("/api/customer/login",async(req,res)=>{
+ try{
+  const phone=String(req.body.phone||"").trim(),password=String(req.body.password||"");
+  const customer=await one("SELECT * FROM customers WHERE phone=?",[phone]);
+  if(!customer||!verifyPassword(password,customer.password_hash))return res.status(401).json({error:"Incorrect phone number or password."});
+  const token=customerToken();
+  await run(usePg?"INSERT INTO customer_sessions(token,customer_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO customer_sessions(token,customer_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,customer.id]);
+  delete customer.password_hash;
+  res.json({token,customer});
+ }catch(e){res.status(500).json({error:e.message});}
+});
+app.get("/api/customer/me",async(req,res)=>{try{const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});res.json({id:c.id,name:c.name,phone:c.phone,email:c.email,address:c.address});}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/customer/logout",async(req,res)=>{try{const token=customerFromRequest(req);if(token)await run("DELETE FROM customer_sessions WHERE token=?",[token]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/admin/login",(req,res)=>{
+ const user=String(req.body.username||""),pass=String(req.body.password||"");
+ if(user!==ADMIN_USER||pass!==ADMIN_PASS)return res.status(401).json({error:"Invalid admin username or password."});
+ res.json({ok:true});
 });
 app.get("/api/products",async(req,res)=>{try{let r=await q("SELECT * FROM products ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/products",auth,upload.any(),async(req,res)=>{
