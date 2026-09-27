@@ -68,3 +68,10 @@ Add these environment variables in Render:
 - `SMS_ADMIN_PHONE` = admin phone in international format, for example `251945306592`
 
 The API key must stay in Render Environment Variables and must not be put in `index.html` or committed to GitHub. If SMS sending fails, the order is still saved normally and the Admin red-dot notification still works.
+
+
+## Customer order status and optional payments
+- Signed-in customers can view their orders and see Waiting for confirmation, Confirmed, or Delivered status.
+- New orders link to the signed-in customer account; guest orders remain guest orders.
+- Checkout includes an optional payment selector for Mastercard, Telebirr, or bank transfer. Payment is never required to place an order.
+- Admin can configure Telebirr details, bank details, and a Mastercard payment link under Admin > Settings. Card numbers are never collected by the store.

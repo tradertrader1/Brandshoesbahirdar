@@ -59,8 +59,8 @@ CREATE TABLE IF NOT EXISTS products(
 CREATE TABLE IF NOT EXISTS orders(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
  customer TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL,
- notes TEXT DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL,
- status TEXT DEFAULT 'NEW', admin_seen INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+ customer_id INTEGER, notes TEXT DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL,
+ payment_method TEXT DEFAULT 'NONE', status TEXT DEFAULT 'NEW', admin_seen INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS settings(
  key TEXT PRIMARY KEY, value TEXT NOT NULL
@@ -130,6 +130,15 @@ async function initDb(){
   if(usePg) await pgPool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_seen INTEGER NOT NULL DEFAULT 0");
   else { try { db.exec("ALTER TABLE orders ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; } }
  } catch(e) { console.error("admin notification migration:",e.message); }
+ // Customer order history and optional payment method migrations.
+ try {
+  if(usePg){
+   await pgPool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_id INTEGER; ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'NONE'");
+  } else {
+   try { db.exec("ALTER TABLE orders ADD COLUMN customer_id INTEGER"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; }
+   try { db.exec("ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'NONE'"); } catch(e) { if(!String(e.message).includes("duplicate column")) throw e; }
+  }
+ } catch(e) { console.error("customer/payment migration:",e.message); }
  // Per-size inventory migration for existing stores.
  try {
   if(usePg) await pgPool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT '{}'; ALTER TABLE products ADD COLUMN IF NOT EXISTS colors TEXT DEFAULT ''; ALTER TABLE products ADD COLUMN IF NOT EXISTS color_stock TEXT DEFAULT '{}'; ALTER TABLE products ADD COLUMN IF NOT EXISTS color_images TEXT DEFAULT '{}'");
@@ -177,6 +186,11 @@ async function initDb(){
  const existingCouponPercent=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
  if(!existingCouponPercent){
   await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent","0"]);
+ }
+ const paymentDefaults={payment_telebirr:"",payment_bank:"",payment_mastercard_link:""};
+ for(const [key,value] of Object.entries(paymentDefaults)){
+  const row=await one("SELECT value FROM settings WHERE key=?",[key]);
+  if(!row) await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);
  }
 }
 
@@ -296,6 +310,31 @@ app.put("/api/settings/coupon",auth,async(req,res)=>{
   res.json({ok:true,couponCode:code,couponPercent:percent});
  }catch(e){res.status(500).json({error:e.message})}
 });
+app.get("/api/payment-options",async(req,res)=>{
+ try{
+  const rows=await q("SELECT key,value FROM settings WHERE key IN ('payment_telebirr','payment_bank','payment_mastercard_link')");
+  const out={telebirr:"",bank:"",mastercardLink:""};
+  for(const r of rows.rows){if(r.key==="payment_telebirr")out.telebirr=r.value||"";if(r.key==="payment_bank")out.bank=r.value||"";if(r.key==="payment_mastercard_link")out.mastercardLink=r.value||"";}
+  res.json(out);
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.get("/api/settings/payment",auth,async(req,res)=>{
+ try{
+  const a=await one("SELECT value FROM settings WHERE key=?",["payment_telebirr"]),b=await one("SELECT value FROM settings WHERE key=?",["payment_bank"]),m=await one("SELECT value FROM settings WHERE key=?",["payment_mastercard_link"]);
+  res.json({telebirr:a?.value||"",bank:b?.value||"",mastercardLink:m?.value||""});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.put("/api/settings/payment",auth,async(req,res)=>{
+ try{
+  const values={payment_telebirr:String(req.body.telebirr||"").trim(),payment_bank:String(req.body.bank||"").trim(),payment_mastercard_link:String(req.body.mastercardLink||"").trim()};
+  for(const [key,value] of Object.entries(values)){
+   const row=await one("SELECT value FROM settings WHERE key=?",[key]);
+   if(row) await run("UPDATE settings SET value=? WHERE key=?",[value,key]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);
+  }
+  res.json({ok:true,telebirr:values.payment_telebirr,bank:values.payment_bank,mastercardLink:values.payment_mastercard_link});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+
 function customerFromRequest(req){
  const token=String(req.headers["x-customer-token"]||req.cookies?.customer_token||"").trim();
  if(!token)return null;
@@ -388,6 +427,11 @@ app.delete("/api/products/:id",auth,async(req,res)=>{await run("DELETE FROM prod
 app.post("/api/orders",async(req,res)=>{
  try{
   const {customer,phone,address,notes,items}=req.body;
+  const signedCustomer=await getCustomer(req);
+  const customerId=signedCustomer?signedCustomer.id:null;
+  const paymentMethod=String(req.body.paymentMethod||"NONE").toUpperCase();
+  const allowedPayments=["NONE","MASTERCARD","TELEBIRR","BANK"];
+  if(!allowedPayments.includes(paymentMethod))return res.status(400).json({error:"Invalid payment method."});
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
   const deliverySetting=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
   const deliveryFee=Math.max(0,Number(deliverySetting&&deliverySetting.value||0));
@@ -417,8 +461,8 @@ app.post("/api/orders",async(req,res)=>{
    if(colorList.length && (!color || colorAvailable<Number(i.qty)))return res.status(409).json({error:`Not enough stock for ${p.name} in color ${color||"selected color"}. Only ${Math.max(0,colorAvailable)} available.`});
   }
   let orderId;
-  if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",[customer,phone,address,notes||"",JSON.stringify(items),total]);orderId=r.rows[0].id}
-  else orderId=db.prepare("INSERT INTO orders(customer,phone,address,notes,items,total) VALUES(?,?,?,?,?,?)").run(customer,phone,address,notes||"",JSON.stringify(items),total).lastInsertRowid;
+  if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",[customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod]);orderId=r.rows[0].id}
+  else orderId=db.prepare("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES(?,?,?,?,?,?,?,?)").run(customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod).lastInsertRowid;
   const smsItems=items.map(i=>`${i.qty}x ${i.name||"shoe"} (size ${i.size||"-"}${i.color?`, ${i.color}`:""})`).join("; ");
   const smsText=`NEW BRAND SHOES ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
   // SMS is a notification only: if the provider is temporarily unavailable, the customer's order still succeeds.
@@ -429,7 +473,16 @@ app.post("/api/orders",async(req,res)=>{
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}${i.color?` color ${i.color}`:""}`).join("\n");
    wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${subtotal.toFixed(2)} ${CURRENCY}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${discount.toFixed(2)} ${CURRENCY}`:""}\nDelivery: ${deliveryFee.toFixed(2)} ${CURRENCY}\nTotal: ${total.toFixed(2)} ${CURRENCY}`)}`;
   }
-  res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total});
+  let paymentUrl="";
+  if(paymentMethod==="MASTERCARD"){const row=await one("SELECT value FROM settings WHERE key=?",["payment_mastercard_link"]);paymentUrl=String(row&&row.value||"").trim();}
+  res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total,paymentMethod,paymentUrl});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.get("/api/customer/orders",async(req,res)=>{
+ try{
+  const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});
+  const r=await q("SELECT id,total,status,created_at,items,payment_method FROM orders WHERE customer_id=? ORDER BY created_at DESC,id DESC",[c.id]);
+  res.json(r.rows);
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/orders/notification-count",async(req,res)=>{try{let r=await q("SELECT COUNT(*) AS n FROM orders WHERE status=? AND admin_seen=0",["NEW"]);res.json({count:Number(r.rows[0].n||0)})}catch(e){res.status(500).json({error:e.message})}});
