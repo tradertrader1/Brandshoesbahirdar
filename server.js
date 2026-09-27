@@ -68,6 +68,48 @@ if(usePg){
   db.pragma("journal_mode=WAL");
 }
 
+function localImageToDataUrl(imagePath){
+ try{
+  if(!imagePath || !String(imagePath).startsWith("/uploads/")) return null;
+  const filename=path.basename(String(imagePath));
+  const full=path.join(uploadsDir,filename);
+  if(!fs.existsSync(full)) return null;
+  const ext=path.extname(filename).toLowerCase();
+  const mime={".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",".webp":"image/webp",".gif":"image/gif",".avif":"image/avif"}[ext]||"application/octet-stream";
+  return `data:${mime};base64,${fs.readFileSync(full).toString("base64")}`;
+ }catch(e){
+  console.error("Image migration read failed:",e.message);
+  return null;
+}
+}
+
+async function migrateLocalImagesToDatabase(){
+ // Render's local filesystem is ephemeral. If old images still exist locally,
+ // convert them into database-backed data URLs before a future restart/redeploy.
+ if(!usePg) return;
+ try{
+  const products=await q("SELECT id,image,color_images FROM products");
+  for(const p of products.rows){
+   let nextImage=p.image||"", changed=false;
+   const migrated=localImageToDataUrl(p.image);
+   if(migrated){ nextImage=migrated; changed=true; }
+
+   let colors={};
+   try{ colors=JSON.parse(p.color_images||"{}"); }catch(e){ colors={}; }
+   for(const key of Object.keys(colors)){
+    const m=localImageToDataUrl(colors[key]);
+    if(m){ colors[key]=m; changed=true; }
+   }
+   if(changed){
+    await run("UPDATE products SET image=?, color_images=? WHERE id=?",[nextImage,JSON.stringify(colors),p.id]);
+    console.log(`Persisted image(s) for product #${p.id} into PostgreSQL.`);
+   }
+  }
+ }catch(e){
+  console.error("Image persistence migration:",e.message);
+ }
+}
+
 async function initDb(){
  if(usePg){ await pgPool.query(schema); }
  else { db.exec(schema.replace(/INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY/g,"INTEGER PRIMARY KEY AUTOINCREMENT")); }
@@ -170,6 +212,15 @@ function imgUrl(req,file){
    stream.end(file.buffer);
   });
  }
+
+ // When PostgreSQL is available, store the image itself in the database.
+ // This prevents Render redeploys/restarts from deleting product photos.
+ if(usePg){
+  const mime=String(file.mimetype||"image/jpeg").split(";")[0];
+  return `data:${mime};base64,${file.buffer.toString("base64")}`;
+ }
+
+ // Local development fallback.
  const name=Date.now()+"-"+crypto.randomBytes(4).toString("hex")+"-"+file.originalname.replace(/[^a-zA-Z0-9._-]/g,"");
  fs.writeFileSync(path.join(uploadsDir,name),file.buffer);
  return "/uploads/"+name;
@@ -361,4 +412,7 @@ app.patch("/api/orders/:id",auth,async(req,res)=>{
 
 app.get("/api/health",async(req,res)=>{try{await one("SELECT 1 AS ok");res.json({ok:true,db:usePg?"postgres":"sqlite"})}catch(e){res.status(500).json({ok:false,error:e.message})}});
 
-initDb().then(()=>app.listen(PORT,()=>console.log(`${STORE_NAME} running on ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initDb()
+ .then(()=>migrateLocalImagesToDatabase())
+ .then(()=>app.listen(PORT,()=>console.log(`${STORE_NAME} running on ${PORT}`)))
+ .catch(e=>{console.error(e);process.exit(1)});

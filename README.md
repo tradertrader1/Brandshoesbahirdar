@@ -27,12 +27,14 @@ CURRENCY=ETB
 For a persistent production database, add a Render PostgreSQL database and set:
 DATABASE_URL=<Render PostgreSQL connection string>
 
-For permanent uploaded product images, create a Cloudinary account and set:
-CLOUDINARY_CLOUD_NAME=...
-CLOUDINARY_API_KEY=...
-CLOUDINARY_API_SECRET=...
+For permanent uploaded product images, the recommended option is Cloudinary. Create a Cloudinary account and set:
+`CLOUDINARY_CLOUD_NAME=...`
+`CLOUDINARY_API_KEY=...`
+`CLOUDINARY_API_SECRET=...`
 
-If Cloudinary is not configured, uploads are saved locally (fine for testing, not recommended for permanent production storage).
+**Image-persistence fix:** if Cloudinary is not configured but `DATABASE_URL` points to Render PostgreSQL, newly uploaded product and color images are now stored directly in PostgreSQL. This prevents Render filesystem resets from deleting the images. On startup, the app also attempts to migrate any still-existing `/uploads/...` images into PostgreSQL.
+
+For production on Render, keep `DATABASE_URL` configured. SQLite + local `/uploads` remains suitable for local testing only because Render's local filesystem is not permanent.
 
 ## Deployment
 
