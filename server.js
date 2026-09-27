@@ -88,6 +88,10 @@ CREATE TABLE IF NOT EXISTS customers(
 );
 CREATE TABLE IF NOT EXISTS customer_sessions(
  token TEXT PRIMARY KEY, customer_id INTEGER NOT NULL, expires_at TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscriptions(
+ id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
+ admin_id INTEGER NOT NULL, store_id INTEGER NOT NULL, amount REAL NOT NULL DEFAULT 0, payment_method TEXT DEFAULT '', reference TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'PENDING', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, paid_at TIMESTAMP
 );`;
 
 if(usePg){
@@ -347,7 +351,7 @@ app.get("/api/config",async(req,res)=>{
   res.json({storeId:store.id,storeSlug:store.slug,storeName:store.name,currency:CURRENCY,whatsapp:w,deliveryFee:Math.max(0,Number(d||0))});
  }catch(e){res.status(500).json({error:e.message})}
 });
-app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`/?store=${encodeURIComponent(req.admin.store_slug)}`,isMainAdmin:Number(req.admin.is_main_admin)===1,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
+app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`${req.protocol}://${req.get("host")}/?store=${encodeURIComponent(req.admin.store_slug)}`,isMainAdmin:Number(req.admin.is_main_admin)===1,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
 app.post("/api/admin/register",async(req,res)=>{
  try{
   const fullName=String(req.body.fullName||"").trim(), username=String(req.body.username||"").trim(), phone=String(req.body.phone||"").trim(), storeName=String(req.body.storeName||"").trim(), password=String(req.body.password||"");
@@ -538,7 +542,34 @@ app.post("/api/customer/login",async(req,res)=>{
 });
 app.get("/api/customer/me",async(req,res)=>{try{const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});res.json({id:c.id,name:c.name,phone:c.phone,email:c.email,address:c.address});}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/customer/logout",async(req,res)=>{try{const token=customerFromRequest(req);if(token)await run("DELETE FROM customer_sessions WHERE token=?",[token]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message})}});
-app.get("/api/products",async(req,res)=>{try{const store=await getPublicStore(req);if(!store)return res.status(404).json({error:"Store not found."});let r=await q("SELECT * FROM products WHERE store_id=? ORDER BY id DESC",[store.id]);res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/subscription/config",auth,async(req,res)=>{try{
+ const fee=Math.max(0,Number(process.env.SUBSCRIPTION_FEE||0)), link=String(process.env.SUBSCRIPTION_PAYMENT_LINK||"").trim();
+ const current=await one("SELECT id,status,amount,payment_method,reference,created_at,paid_at FROM subscriptions WHERE admin_id=? ORDER BY id DESC LIMIT 1",[req.admin.id]);
+ res.json({fee,paymentLink:link,current});
+}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/subscription/request",auth,async(req,res)=>{try{
+ const method=String(req.body.paymentMethod||"").trim().toUpperCase(), reference=String(req.body.reference||"").trim();
+ if(!["TELEBIRR","BANK","MASTERCARD"].includes(method))return res.status(400).json({error:"Choose Telebirr, Bank transfer, or Mastercard."});
+ const fee=Math.max(0,Number(process.env.SUBSCRIPTION_FEE||0));
+ if(fee<=0)return res.status(400).json({error:"Main Admin has not configured the subscription fee yet."});
+ const existing=await one("SELECT id,status FROM subscriptions WHERE admin_id=? ORDER BY id DESC LIMIT 1",[req.admin.id]);
+ if(existing && String(existing.status).toUpperCase()==="PENDING")return res.status(409).json({error:"You already have a pending subscription payment."});
+ let id;
+ if(usePg){const r=await pgPool.query("INSERT INTO subscriptions(admin_id,store_id,amount,payment_method,reference,status) VALUES($1,$2,$3,$4,$5,'PENDING') RETURNING id",[req.admin.id,req.admin.store_id,fee,method,reference]);id=r.rows[0].id;}else{id=db.prepare("INSERT INTO subscriptions(admin_id,store_id,amount,payment_method,reference,status) VALUES(?,?,?,?,?,?)").run(req.admin.id,req.admin.store_id,fee,method,reference,"PENDING").lastInsertRowid;}
+ res.json({ok:true,id,status:"PENDING",message:"Payment submitted for Main Admin verification."});
+}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/main-admin/subscriptions",auth,async(req,res)=>{try{if(Number(req.admin.is_main_admin)!==1)return res.status(403).json({error:"Main Admin access required."});const r=await q("SELECT x.*,a.username,a.full_name,s.name AS store_name FROM subscriptions x JOIN admins a ON a.id=x.admin_id JOIN stores s ON s.id=x.store_id ORDER BY x.created_at DESC,x.id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.patch("/api/main-admin/subscriptions/:id",auth,async(req,res)=>{try{if(Number(req.admin.is_main_admin)!==1)return res.status(403).json({error:"Main Admin access required."});const status=String(req.body.status||"").toUpperCase();if(!["PAID","REJECTED","PENDING"].includes(status))return res.status(400).json({error:"Invalid subscription status."});await run("UPDATE subscriptions SET status=?,paid_at=? WHERE id=?",[status,status==="PAID"?new Date().toISOString():null,req.params.id]);res.json({ok:true,status})}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/products",async(req,res)=>{try{
+ const slug=String(req.query.store||req.headers["x-store-slug"]||"").trim();
+ let r;
+ if(slug){
+  r=await q("SELECT p.*,s.name AS store_name,s.slug AS store_slug FROM products p JOIN stores s ON s.id=p.store_id WHERE s.slug=? AND EXISTS (SELECT 1 FROM admins a WHERE a.store_id=s.id AND a.is_active=1) ORDER BY p.id DESC",[slug]);
+ }else{
+  r=await q("SELECT p.*,s.name AS store_name,s.slug AS store_slug FROM products p JOIN stores s ON s.id=p.store_id WHERE EXISTS (SELECT 1 FROM admins a WHERE a.store_id=s.id AND a.is_active=1) ORDER BY p.id DESC",[]);
+ }
+ res.json(r.rows);
+}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/products",auth,upload.any(),async(req,res)=>{
  try{
   const p=req.body; const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."}); if(!p.name||p.price===undefined)return res.status(400).json({error:"Name and price are required"});
@@ -641,8 +672,14 @@ app.post("/api/orders",async(req,res)=>{
 app.get("/api/customer/orders",async(req,res)=>{
  try{
   const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});
-  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
-  const r=await q("SELECT id,total,status,created_at,items,payment_method FROM orders WHERE customer_id=? AND store_id=? ORDER BY created_at DESC,id DESC",[c.id,store.id]);
+  const slug=String(req.query.store||req.headers["x-store-slug"]||"").trim();
+  let r;
+  if(slug){
+   const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+   r=await q("SELECT o.id,o.total,o.status,o.created_at,o.items,o.payment_method,s.name AS store_name,s.slug AS store_slug FROM orders o JOIN stores s ON s.id=o.store_id WHERE o.customer_id=? AND o.store_id=? ORDER BY o.created_at DESC,o.id DESC",[c.id,store.id]);
+  }else{
+   r=await q("SELECT o.id,o.total,o.status,o.created_at,o.items,o.payment_method,s.name AS store_name,s.slug AS store_slug FROM orders o JOIN stores s ON s.id=o.store_id WHERE o.customer_id=? ORDER BY o.created_at DESC,o.id DESC",[c.id]);
+  }
   res.json(r.rows);
  }catch(e){res.status(500).json({error:e.message})}
 });
