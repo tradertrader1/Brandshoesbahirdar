@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS stores(
 );
 CREATE TABLE IF NOT EXISTS admins(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
- store_id INTEGER NOT NULL, username TEXT NOT NULL UNIQUE, full_name TEXT DEFAULT '', phone TEXT DEFAULT '', password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+ store_id INTEGER NOT NULL, username TEXT NOT NULL UNIQUE, full_name TEXT DEFAULT '', phone TEXT DEFAULT '', password_hash TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, is_main_admin INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS admin_sessions(
  token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TIMESTAMP NOT NULL
@@ -150,6 +150,16 @@ async function uniqueStoreSlug(name){
  return slug;
 }
 async function ensureMultiStoreSchema(){
+ // Add admin control columns to existing databases.
+ try{
+  if(usePg){
+   await pgPool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS is_active INTEGER NOT NULL DEFAULT 1");
+   await pgPool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS is_main_admin INTEGER NOT NULL DEFAULT 0");
+  }else{
+   try{db.exec("ALTER TABLE admins ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")}catch(e){if(!String(e.message).toLowerCase().includes("duplicate column"))throw e;}
+   try{db.exec("ALTER TABLE admins ADD COLUMN is_main_admin INTEGER NOT NULL DEFAULT 0")}catch(e){if(!String(e.message).toLowerCase().includes("duplicate column"))throw e;}
+  }
+ }catch(e){console.error("admin control migration:",e.message)}
  // Add store ownership columns to existing tables.
  for(const table of ["products","orders"]){
   try{
@@ -171,12 +181,16 @@ async function ensureMultiStoreSchema(){
   const exists=await one("SELECT value FROM store_settings WHERE store_id=? AND key=?",[store.id,row.key]);
   if(!exists) await run("INSERT INTO store_settings(store_id,key,value) VALUES(?,?,?)",[store.id,row.key,row.value]);
  }
- // Seed the first admin from the existing environment credentials.
- const adminCount=await q("SELECT COUNT(*) AS n FROM admins");
- if(Number(adminCount.rows[0].n||0)===0){
+ // The Render environment credentials always identify the Main Admin.
+ // If that admin does not exist yet, create it in the default store.
+ let mainAdmin=await one("SELECT * FROM admins WHERE username=?",[ADMIN_USER]);
+ if(!mainAdmin){
   const ph=makePasswordHash(ADMIN_PASS);
-  if(usePg){await pgPool.query("INSERT INTO admins(store_id,username,full_name,password_hash) VALUES($1,$2,$3,$4)",[store.id,ADMIN_USER,"Store Admin",ph]);}
-  else db.prepare("INSERT INTO admins(store_id,username,full_name,password_hash) VALUES(?,?,?,?)").run(store.id,ADMIN_USER,"Store Admin",ph);
+  if(usePg){await pgPool.query("INSERT INTO admins(store_id,username,full_name,password_hash,is_active,is_main_admin) VALUES($1,$2,$3,$4,1,1)",[store.id,ADMIN_USER,"Main Admin",ph]);}
+  else db.prepare("INSERT INTO admins(store_id,username,full_name,password_hash,is_active,is_main_admin) VALUES(?,?,?,?,1,1)").run(store.id,ADMIN_USER,"Main Admin",ph);
+ }else{
+  // Keep the Render-configured account as the single Main Admin.
+  await run("UPDATE admins SET is_main_admin=CASE WHEN username=? THEN 1 ELSE 0 END WHERE username=? OR is_main_admin=1",[ADMIN_USER,ADMIN_USER]);
  }
  // Give every new store sensible payment/settings defaults when it is created.
 }
@@ -201,7 +215,7 @@ async function setSetting(storeId,key,value){
 function adminToken(){return crypto.randomBytes(32).toString("hex");}
 async function getAdminFromToken(token){
  if(!token)return null;
- return await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,s.name AS store_name,s.slug AS store_slug FROM admin_sessions x JOIN admins a ON a.id=x.admin_id JOIN stores s ON s.id=a.store_id WHERE x.token=? AND x.expires_at>CURRENT_TIMESTAMP",[token]);
+ return await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,a.is_active,a.is_main_admin,s.name AS store_name,s.slug AS store_slug FROM admin_sessions x JOIN admins a ON a.id=x.admin_id JOIN stores s ON s.id=a.store_id WHERE x.token=? AND x.expires_at>CURRENT_TIMESTAMP AND a.is_active=1",[token]);
 }
 async function getAdminStore(req){return req.admin?.store_id?await one("SELECT * FROM stores WHERE id=?",[req.admin.store_id]):null;}
 
@@ -297,8 +311,8 @@ async function auth(req,res,next){
   if(!admin && h.startsWith("Basic ")){
    const raw=Buffer.from(h.slice(6),"base64").toString(); const pos=raw.indexOf(":");
    const u=pos>=0?raw.slice(0,pos):raw, p=pos>=0?raw.slice(pos+1):"";
-   const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,s.name AS store_name,s.slug AS store_slug,a.password_hash FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[u]);
-   if(a && verifyPassword(p,a.password_hash)){admin=a;}
+   const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,a.is_active,a.is_main_admin,s.name AS store_name,s.slug AS store_slug,a.password_hash FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[u]);
+   if(a && Number(a.is_active)!==0 && verifyPassword(p,a.password_hash)){admin=a;}
   }
   if(!admin)return res.status(401).json({error:"Admin sign in required."});
   req.admin=admin; next();
@@ -333,7 +347,7 @@ app.get("/api/config",async(req,res)=>{
   res.json({storeId:store.id,storeSlug:store.slug,storeName:store.name,currency:CURRENCY,whatsapp:w,deliveryFee:Math.max(0,Number(d||0))});
  }catch(e){res.status(500).json({error:e.message})}
 });
-app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`/?store=${encodeURIComponent(req.admin.store_slug)}`,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
+app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`/?store=${encodeURIComponent(req.admin.store_slug)}`,isMainAdmin:Number(req.admin.is_main_admin)===1,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
 app.post("/api/admin/register",async(req,res)=>{
  try{
   const fullName=String(req.body.fullName||"").trim(), username=String(req.body.username||"").trim(), phone=String(req.body.phone||"").trim(), storeName=String(req.body.storeName||"").trim(), password=String(req.body.password||"");
@@ -344,23 +358,48 @@ app.post("/api/admin/register",async(req,res)=>{
   if(usePg){const sr=await pgPool.query("INSERT INTO stores(name,slug) VALUES($1,$2) RETURNING id",[storeName,slug]);storeId=sr.rows[0].id;}
   else storeId=db.prepare("INSERT INTO stores(name,slug) VALUES(?,?)").run(storeName,slug).lastInsertRowid;
   const ph=makePasswordHash(password); let adminId;
-  if(usePg){const ar=await pgPool.query("INSERT INTO admins(store_id,username,full_name,phone,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id",[storeId,username,fullName,phone,ph]);adminId=ar.rows[0].id;}
-  else adminId=db.prepare("INSERT INTO admins(store_id,username,full_name,phone,password_hash) VALUES(?,?,?,?,?)").run(storeId,username,fullName,phone,ph).lastInsertRowid;
+  if(usePg){const ar=await pgPool.query("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES($1,$2,$3,$4,$5,1,0) RETURNING id",[storeId,username,fullName,phone,ph]);adminId=ar.rows[0].id;}
+  else adminId=db.prepare("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES(?,?,?,?,?,1,0)").run(storeId,username,fullName,phone,ph).lastInsertRowid;
   const defaults={whatsapp:WHATSAPP,delivery_fee:"0",coupon_code:"",coupon_percent:"0",payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
   for(const [key,value] of Object.entries(defaults))await setSetting(storeId,key,value);
   const token=adminToken();
   await run(usePg?"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,adminId]);
-  res.json({ok:true,token,admin:{id:adminId,username,fullName,phone,storeId,storeName,storeSlug:slug,storeUrl:`/?store=${encodeURIComponent(slug)}`}});
+  res.json({ok:true,token,admin:{id:adminId,username,fullName,phone,storeId,storeName,storeSlug:slug,storeUrl:`/?store=${encodeURIComponent(slug)}`,isMainAdmin:false}});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.post("/api/admin/login",async(req,res)=>{
  try{
   const user=String(req.body.username||"").trim(),pass=String(req.body.password||"");
-  const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,a.password_hash,s.name AS store_name,s.slug AS store_slug FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[user]);
-  if(!a||!verifyPassword(pass,a.password_hash))return res.status(401).json({error:"Invalid admin username or password."});
+  const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,a.password_hash,a.is_active,a.is_main_admin,s.name AS store_name,s.slug AS store_slug FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[user]);
+  if(!a||Number(a.is_active)===0||!verifyPassword(pass,a.password_hash))return res.status(401).json({error:Number(a?.is_active)===0?"This admin account has been disabled by the Main Admin.":"Invalid admin username or password."});
   const token=adminToken(); await run(usePg?"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,a.id]);
-  res.json({ok:true,token,admin:{id:a.id,username:a.username,fullName:a.full_name,phone:a.phone,storeId:a.store_id,storeName:a.store_name,storeSlug:a.store_slug,storeUrl:`/?store=${encodeURIComponent(a.store_slug)}`}});
+  res.json({ok:true,token,admin:{id:a.id,username:a.username,fullName:a.full_name,phone:a.phone,storeId:a.store_id,storeName:a.store_name,storeSlug:a.store_slug,storeUrl:`/?store=${encodeURIComponent(a.store_slug)}`,isMainAdmin:Number(a.is_main_admin)===1}});
  }catch(e){res.status(500).json({error:e.message})}
+});
+function mainAdminOnly(req,res,next){
+ if(!req.admin || Number(req.admin.is_main_admin)!==1) return res.status(403).json({error:"Main Admin access required."});
+ next();
+}
+app.get("/api/main-admin/admins",auth,mainAdminOnly,async(req,res)=>{
+ const result=await q("SELECT a.id,a.username,a.full_name,a.phone,a.is_active,a.is_main_admin,a.created_at,s.id AS store_id,s.name AS store_name,s.slug AS store_slug FROM admins a JOIN stores s ON s.id=a.store_id ORDER BY a.id ASC");
+ res.json(result.rows.map(a=>({...a,isActive:Number(a.is_active)===1,isMainAdmin:Number(a.is_main_admin)===1,storeUrl:`/?store=${encodeURIComponent(a.store_slug)}`})));
+});
+app.patch("/api/main-admin/admins/:id/status",auth,mainAdminOnly,async(req,res)=>{
+ const id=Number(req.params.id), active=Boolean(req.body?.active);
+ const target=await one("SELECT id,username,is_main_admin FROM admins WHERE id=?",[id]);
+ if(!target)return res.status(404).json({error:"Admin not found."});
+ if(Number(target.is_main_admin)===1 || target.username===ADMIN_USER)return res.status(400).json({error:"The Main Admin account cannot be disabled."});
+ await run("UPDATE admins SET is_active=? WHERE id=?",[active?1:0,id]);
+ if(!active) await run("DELETE FROM admin_sessions WHERE admin_id=?",[id]);
+ res.json({ok:true,isActive:active});
+});
+app.delete("/api/main-admin/admins/:id",auth,mainAdminOnly,async(req,res)=>{
+ const id=Number(req.params.id), target=await one("SELECT id,username,is_main_admin FROM admins WHERE id=?",[id]);
+ if(!target)return res.status(404).json({error:"Admin not found."});
+ if(Number(target.is_main_admin)===1 || target.username===ADMIN_USER)return res.status(400).json({error:"The Main Admin account cannot be deleted."});
+ await run("DELETE FROM admin_sessions WHERE admin_id=?",[id]);
+ await run("DELETE FROM admins WHERE id=?",[id]);
+ res.json({ok:true});
 });
 app.post("/api/admin/logout",auth,async(req,res)=>{try{const h=req.headers.authorization||"";if(h.startsWith("Bearer "))await run("DELETE FROM admin_sessions WHERE token=?",[h.slice(7).trim()]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 app.put("/api/settings/store",auth,async(req,res)=>{
