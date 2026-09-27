@@ -24,16 +24,18 @@ function makePasswordHash(password){const salt=crypto.randomBytes(16).toString("
 function verifyPassword(password,stored){try{const [salt,hash]=String(stored||"").split(":");if(!salt||!hash)return false;const actual=hashPassword(password,salt);return crypto.timingSafeEqual(Buffer.from(actual,"hex"),Buffer.from(hash,"hex"));}catch(e){return false;}}
 function customerToken(){return crypto.randomBytes(32).toString("hex");}
 
-async function sendAdminSMS(message){
+async function sendAdminSMS(message, recipientPhone=""){
  if(!SMS_ENABLED){
   console.log("SMS notification skipped: SMS_API_KEY or SMS_ADMIN_PHONE is not configured.");
   return {sent:false,skipped:true};
  }
  try{
+  const destination=String(recipientPhone||SMS_ADMIN_PHONE).replace(/\D/g,"");
+  if(!destination)return {sent:false,skipped:true};
   const response=await fetch("https://smsethiopia.com/api/sms/send",{
    method:"POST",
    headers:{"KEY":SMS_API_KEY,"Content-Type":"application/json"},
-   body:JSON.stringify({msisdn:SMS_ADMIN_PHONE,text:message})
+   body:JSON.stringify({msisdn:destination,text:message})
   });
   const text=await response.text();
   let data={}; try{data=JSON.parse(text)}catch(e){data={raw:text}}
@@ -50,16 +52,30 @@ const usePg=!!process.env.DATABASE_URL;
 let db, pgPool;
 
 const schema=`
+CREATE TABLE IF NOT EXISTS stores(
+ id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
+ name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS admins(
+ id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
+ store_id INTEGER NOT NULL, username TEXT NOT NULL UNIQUE, full_name TEXT DEFAULT '', phone TEXT DEFAULT '', password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS admin_sessions(
+ token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_settings(
+ store_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(store_id,key)
+);
 CREATE TABLE IF NOT EXISTS products(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
- name TEXT NOT NULL, brand TEXT DEFAULT '', price REAL NOT NULL,
+ store_id INTEGER, name TEXT NOT NULL, brand TEXT DEFAULT '', price REAL NOT NULL,
  old_price REAL, sizes TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0, size_stock TEXT DEFAULT '{}', colors TEXT DEFAULT '', color_stock TEXT DEFAULT '{}', color_images TEXT DEFAULT '{}',
  category TEXT DEFAULT 'Shoes', image TEXT DEFAULT '',
  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS orders(
  id INTEGER PRIMARY KEY ${usePg?"GENERATED ALWAYS AS IDENTITY":""},
- customer TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL,
+ store_id INTEGER, customer TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL,
  customer_id INTEGER, notes TEXT DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL,
  payment_method TEXT DEFAULT 'NONE', status TEXT DEFAULT 'NEW', admin_seen INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -123,9 +139,76 @@ async function migrateLocalImagesToDatabase(){
  }
 }
 
+
+function slugifyStoreName(name){
+ const base=String(name||"store").toLowerCase().trim().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,45)||"store";
+ return base;
+}
+async function uniqueStoreSlug(name){
+ const base=slugifyStoreName(name); let slug=base, n=1;
+ while(await one("SELECT id FROM stores WHERE slug=?",[slug])){n++;slug=`${base}-${n}`;}
+ return slug;
+}
+async function ensureMultiStoreSchema(){
+ // Add store ownership columns to existing tables.
+ for(const table of ["products","orders"]){
+  try{
+   if(usePg) await pgPool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS store_id INTEGER`);
+   else { try{db.exec(`ALTER TABLE ${table} ADD COLUMN store_id INTEGER`)}catch(e){if(!String(e.message).toLowerCase().includes("duplicate column"))throw e;} }
+  }catch(e){console.error(`store_id migration for ${table}:`,e.message)}
+ }
+ let store=await one("SELECT * FROM stores ORDER BY id ASC LIMIT 1");
+ if(!store){
+  const name=STORE_NAME; const slug=await uniqueStoreSlug(name);
+  if(usePg){const r=await pgPool.query("INSERT INTO stores(name,slug) VALUES($1,$2) RETURNING id,name,slug",[name,slug]);store=r.rows[0];}
+  else {const r=db.prepare("INSERT INTO stores(name,slug) VALUES(?,?)").run(name,slug);store=await one("SELECT * FROM stores WHERE id=?",[r.lastInsertRowid]);}
+ }
+ await run("UPDATE products SET store_id=? WHERE store_id IS NULL",[store.id]);
+ await run("UPDATE orders SET store_id=? WHERE store_id IS NULL",[store.id]);
+ // Copy legacy single-store settings into the default store's isolated settings table.
+ const legacy=await q("SELECT key,value FROM settings");
+ for(const row of legacy.rows){
+  const exists=await one("SELECT value FROM store_settings WHERE store_id=? AND key=?",[store.id,row.key]);
+  if(!exists) await run("INSERT INTO store_settings(store_id,key,value) VALUES(?,?,?)",[store.id,row.key,row.value]);
+ }
+ // Seed the first admin from the existing environment credentials.
+ const adminCount=await q("SELECT COUNT(*) AS n FROM admins");
+ if(Number(adminCount.rows[0].n||0)===0){
+  const ph=makePasswordHash(ADMIN_PASS);
+  if(usePg){await pgPool.query("INSERT INTO admins(store_id,username,full_name,password_hash) VALUES($1,$2,$3,$4)",[store.id,ADMIN_USER,"Store Admin",ph]);}
+  else db.prepare("INSERT INTO admins(store_id,username,full_name,password_hash) VALUES(?,?,?,?)").run(store.id,ADMIN_USER,"Store Admin",ph);
+ }
+ // Give every new store sensible payment/settings defaults when it is created.
+}
+async function getStoreBySlug(slug){
+ if(slug){return await one("SELECT * FROM stores WHERE slug=?",[slug]);}
+ return await one("SELECT * FROM stores ORDER BY id ASC LIMIT 1");
+}
+async function getPublicStore(req){
+ const slug=String(req.query.store||req.headers["x-store-slug"]||"").trim();
+ const store=await getStoreBySlug(slug);
+ return store;
+}
+async function getSetting(storeId,key, fallback=""){
+ const row=await one("SELECT value FROM store_settings WHERE store_id=? AND key=?",[storeId,key]);
+ return row?String(row.value??""):fallback;
+}
+async function setSetting(storeId,key,value){
+ const row=await one("SELECT value FROM store_settings WHERE store_id=? AND key=?",[storeId,key]);
+ if(row) await run("UPDATE store_settings SET value=? WHERE store_id=? AND key=?",[String(value),storeId,key]);
+ else await run("INSERT INTO store_settings(store_id,key,value) VALUES(?,?,?)",[storeId,key,String(value)]);
+}
+function adminToken(){return crypto.randomBytes(32).toString("hex");}
+async function getAdminFromToken(token){
+ if(!token)return null;
+ return await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,s.name AS store_name,s.slug AS store_slug FROM admin_sessions x JOIN admins a ON a.id=x.admin_id JOIN stores s ON s.id=a.store_id WHERE x.token=? AND x.expires_at>CURRENT_TIMESTAMP",[token]);
+}
+async function getAdminStore(req){return req.admin?.store_id?await one("SELECT * FROM stores WHERE id=?",[req.admin.store_id]):null;}
+
 async function initDb(){
  if(usePg){ await pgPool.query(schema); }
  else { db.exec(schema.replace(/INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY/g,"INTEGER PRIMARY KEY AUTOINCREMENT")); }
+ await ensureMultiStoreSchema();
  // Admin notification migration for existing stores.
  try {
   if(usePg) await pgPool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_seen INTEGER NOT NULL DEFAULT 0");
@@ -172,27 +255,10 @@ async function initDb(){
    else db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,color_images,category,image) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(...vals);
   }
  }
- const existingWhatsApp=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
- if(!existingWhatsApp){
-  await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",WHATSAPP]);
- }
- const existingDelivery=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
- if(!existingDelivery){
-  await run("INSERT INTO settings(key,value) VALUES(?,?)",["delivery_fee","0"]);
- }
- const existingCouponCode=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
- if(!existingCouponCode){
-  await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_code",""]);
- }
- const existingCouponPercent=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
- if(!existingCouponPercent){
-  await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent","0"]);
- }
- const paymentDefaults={payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
- for(const [key,value] of Object.entries(paymentDefaults)){
-  const row=await one("SELECT value FROM settings WHERE key=?",[key]);
-  if(!row) await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);
- }
+ const defaultStore=await getStoreBySlug("");
+ const defaults={whatsapp:WHATSAPP,delivery_fee:"0",coupon_code:"",coupon_percent:"0",payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
+ for(const [key,value] of Object.entries(defaults)){const row=await one("SELECT value FROM store_settings WHERE store_id=? AND key=?",[defaultStore.id,key]);if(!row)await setSetting(defaultStore.id,key,value);}
+
 }
 
 async function q(sql,params=[]){
@@ -223,19 +289,26 @@ app.use(express.json({limit:"1mb"}));
 app.use("/uploads",express.static(uploadsDir));
 app.get("/",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
 
-function auth(req,res,next){
- const h=req.headers.authorization||"";
- if(!h.startsWith("Basic ")) return res.status(401).set("WWW-Authenticate",'Basic realm="Store Admin"').end();
- const raw=Buffer.from(h.slice(6),"base64").toString();
- const pos=raw.indexOf(":"); const u=pos>=0?raw.slice(0,pos):raw,p=pos>=0?raw.slice(pos+1):"";
- if(u!==ADMIN_USER||p!==ADMIN_PASS)return res.status(403).json({error:"Invalid admin credentials"});
- next();
+async function auth(req,res,next){
+ try{
+  const h=req.headers.authorization||"";
+  let admin=null;
+  if(h.startsWith("Bearer ")) admin=await getAdminFromToken(h.slice(7).trim());
+  if(!admin && h.startsWith("Basic ")){
+   const raw=Buffer.from(h.slice(6),"base64").toString(); const pos=raw.indexOf(":");
+   const u=pos>=0?raw.slice(0,pos):raw, p=pos>=0?raw.slice(pos+1):"";
+   const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,s.name AS store_name,s.slug AS store_slug,a.password_hash FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[u]);
+   if(a && verifyPassword(p,a.password_hash)){admin=a;}
+  }
+  if(!admin)return res.status(401).json({error:"Admin sign in required."});
+  req.admin=admin; next();
+ }catch(e){res.status(500).json({error:e.message})}
 }
 function imgUrl(req,file){
  if(!file)return "";
  if(process.env.CLOUDINARY_CLOUD_NAME){
   return new Promise((resolve,reject)=>{
-   const stream=cloudinary.uploader.upload_stream({folder:"brand-shoes"},(err,result)=>err?reject(err):resolve(result.secure_url));
+   const stream=cloudinary.uploader.upload_stream({folder:`brand-shoes/${req.admin?.store_slug||"default"}`},(err,result)=>err?reject(err):resolve(result.secure_url));
    stream.end(file.buffer);
   });
  }
@@ -255,36 +328,73 @@ function imgUrl(req,file){
 
 app.get("/api/config",async(req,res)=>{
  try{
-  const w=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
-  const d=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
-  res.json({storeName:STORE_NAME,currency:CURRENCY,whatsapp:(w&&w.value)||WHATSAPP,deliveryFee:Math.max(0,Number(d&&d.value||0))});
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  const w=await getSetting(store.id,"whatsapp",WHATSAPP), d=await getSetting(store.id,"delivery_fee","0");
+  res.json({storeId:store.id,storeSlug:store.slug,storeName:store.name,currency:CURRENCY,whatsapp:w,deliveryFee:Math.max(0,Number(d||0))});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`/?store=${encodeURIComponent(req.admin.store_slug)}`,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
+app.post("/api/admin/register",async(req,res)=>{
+ try{
+  const fullName=String(req.body.fullName||"").trim(), username=String(req.body.username||"").trim(), phone=String(req.body.phone||"").trim(), storeName=String(req.body.storeName||"").trim(), password=String(req.body.password||"");
+  if(fullName.length<2||username.length<3||storeName.length<2||password.length<6)return res.status(400).json({error:"Enter your name, store name, username and a password of at least 6 characters."});
+  if(!/^[A-Za-z0-9_.-]+$/.test(username))return res.status(400).json({error:"Username may contain letters, numbers, dots, underscores and hyphens."});
+  if(await one("SELECT id FROM admins WHERE username=?",[username]))return res.status(409).json({error:"That admin username is already in use."});
+  const slug=await uniqueStoreSlug(storeName); let storeId;
+  if(usePg){const sr=await pgPool.query("INSERT INTO stores(name,slug) VALUES($1,$2) RETURNING id",[storeName,slug]);storeId=sr.rows[0].id;}
+  else storeId=db.prepare("INSERT INTO stores(name,slug) VALUES(?,?)").run(storeName,slug).lastInsertRowid;
+  const ph=makePasswordHash(password); let adminId;
+  if(usePg){const ar=await pgPool.query("INSERT INTO admins(store_id,username,full_name,phone,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id",[storeId,username,fullName,phone,ph]);adminId=ar.rows[0].id;}
+  else adminId=db.prepare("INSERT INTO admins(store_id,username,full_name,phone,password_hash) VALUES(?,?,?,?,?)").run(storeId,username,fullName,phone,ph).lastInsertRowid;
+  const defaults={whatsapp:WHATSAPP,delivery_fee:"0",coupon_code:"",coupon_percent:"0",payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
+  for(const [key,value] of Object.entries(defaults))await setSetting(storeId,key,value);
+  const token=adminToken();
+  await run(usePg?"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,adminId]);
+  res.json({ok:true,token,admin:{id:adminId,username,fullName,phone,storeId,storeName,storeSlug:slug,storeUrl:`/?store=${encodeURIComponent(slug)}`}});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.post("/api/admin/login",async(req,res)=>{
+ try{
+  const user=String(req.body.username||"").trim(),pass=String(req.body.password||"");
+  const a=await one("SELECT a.id,a.store_id,a.username,a.full_name,a.phone,a.password_hash,s.name AS store_name,s.slug AS store_slug FROM admins a JOIN stores s ON s.id=a.store_id WHERE a.username=?",[user]);
+  if(!a||!verifyPassword(pass,a.password_hash))return res.status(401).json({error:"Invalid admin username or password."});
+  const token=adminToken(); await run(usePg?"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,a.id]);
+  res.json({ok:true,token,admin:{id:a.id,username:a.username,fullName:a.full_name,phone:a.phone,storeId:a.store_id,storeName:a.store_name,storeSlug:a.store_slug,storeUrl:`/?store=${encodeURIComponent(a.store_slug)}`}});
+ }catch(e){res.status(500).json({error:e.message})}
+});
+app.post("/api/admin/logout",auth,async(req,res)=>{try{const h=req.headers.authorization||"";if(h.startsWith("Bearer "))await run("DELETE FROM admin_sessions WHERE token=?",[h.slice(7).trim()]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
+app.put("/api/settings/store",auth,async(req,res)=>{
+ try{
+  const name=String(req.body.storeName||"").trim();
+  if(name.length<2||name.length>80)return res.status(400).json({error:"Store name must be between 2 and 80 characters."});
+  await run("UPDATE stores SET name=? WHERE id=?",[name,req.admin.store_id]);
+  res.json({ok:true,storeName:name});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/settings/whatsapp",auth,async(req,res)=>{
  try{
   const number=String(req.body.whatsapp||"").replace(/\D/g,"");
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   if(number.length<8 || number.length>15)return res.status(400).json({error:"Enter a valid WhatsApp number in international format, e.g. 251945306592."});
-  const existing=await one("SELECT value FROM settings WHERE key=?",["whatsapp"]);
-  if(existing) await run("UPDATE settings SET value=? WHERE key=?",[number,"whatsapp"]);
-  else await run("INSERT INTO settings(key,value) VALUES(?,?)",["whatsapp",number]);
+  await setSetting(store.id,"whatsapp",number);
   res.json({ok:true,whatsapp:number});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/settings/delivery",auth,async(req,res)=>{
  try{
   const fee=Number(req.body.deliveryFee);
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   if(!Number.isFinite(fee)||fee<0)return res.status(400).json({error:"Enter a valid delivery price of 0 or more."});
-  const existing=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
-  if(existing) await run("UPDATE settings SET value=? WHERE key=?",[String(fee),"delivery_fee"]);
-  else await run("INSERT INTO settings(key,value) VALUES(?,?)",["delivery_fee",String(fee)]);
+  await setSetting(store.id,"delivery_fee",String(fee));
   res.json({ok:true,deliveryFee:fee});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/coupon",async(req,res)=>{
  try{
   const entered=String(req.query.code||"").trim().toUpperCase();
-  const codeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
-  const percentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  const codeRow={value:await getSetting(store.id,"coupon_code","")};
+  const percentRow={value:await getSetting(store.id,"coupon_percent","0")};
   const configured=String(codeRow&&codeRow.value||"").trim().toUpperCase();
   const percent=Math.min(100,Math.max(0,Number(percentRow&&percentRow.value||0)));
   if(!entered || !configured || percent<=0 || entered!==configured)return res.status(400).json({valid:false,error:"Invalid or expired discount coupon."});
@@ -293,8 +403,9 @@ app.get("/api/coupon",async(req,res)=>{
 });
 app.get("/api/settings/coupon",auth,async(req,res)=>{
  try{
-  const codeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
-  const percentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  const codeRow={value:await getSetting(store.id,"coupon_code","")};
+  const percentRow={value:await getSetting(store.id,"coupon_percent","0")};
   res.json({couponCode:String(codeRow&&codeRow.value||""),couponPercent:Math.min(100,Math.max(0,Number(percentRow&&percentRow.value||0)))});
  }catch(e){res.status(500).json({error:e.message})}
 });
@@ -304,42 +415,43 @@ app.put("/api/settings/coupon",auth,async(req,res)=>{
   const percent=Number(req.body.couponPercent);
   if(code && !/^[A-Z0-9_-]{3,30}$/.test(code))return res.status(400).json({error:"Coupon code must be 3-30 letters, numbers, hyphens or underscores."});
   if(!Number.isFinite(percent)||percent<0||percent>100)return res.status(400).json({error:"Discount percent must be between 0 and 100."});
-  const existingCode=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
-  const existingPercent=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
-  if(existingCode) await run("UPDATE settings SET value=? WHERE key=?",[code,"coupon_code"]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_code",code]);
-  if(existingPercent) await run("UPDATE settings SET value=? WHERE key=?",[String(percent),"coupon_percent"]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",["coupon_percent",String(percent)]);
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  await setSetting(store.id,"coupon_code",code); await setSetting(store.id,"coupon_percent",String(percent));
   res.json({ok:true,couponCode:code,couponPercent:percent});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/payment-options",async(req,res)=>{
  try{
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   const keys=["payment_telebirr","payment_telebirr_enabled","payment_telebirr_link","payment_bank","payment_bank_enabled","payment_bank_link","payment_mastercard_details","payment_mastercard_enabled","payment_mastercard_link"];
-  const rows=await q("SELECT key,value FROM settings WHERE key IN ("+keys.map(()=>"?").join(",")+")",keys);
-  const v={}; for(const r of rows.rows)v[r.key]=r.value||"";
+  const v={}; for(const key of keys)v[key]=await getSetting(store.id,key,"");
   res.json({telebirr:v.payment_telebirr||"",telebirrEnabled:v.payment_telebirr_enabled==="1",telebirrDetails:v.payment_telebirr||"",telebirrLink:v.payment_telebirr_link||"",bank:v.payment_bank||"",bankEnabled:v.payment_bank_enabled==="1",bankDetails:v.payment_bank||"",bankLink:v.payment_bank_link||"",mastercardDetails:v.payment_mastercard_details||"",mastercardEnabled:v.payment_mastercard_enabled==="1",mastercardLink:v.payment_mastercard_link||""});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/settings/payment",auth,async(req,res)=>{
  try{
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   const keys=["payment_telebirr","payment_telebirr_enabled","payment_telebirr_link","payment_bank","payment_bank_enabled","payment_bank_link","payment_mastercard_details","payment_mastercard_enabled","payment_mastercard_link"];
-  const rows=await q("SELECT key,value FROM settings WHERE key IN ("+keys.map(()=>"?").join(",")+")",keys); const v={}; for(const r of rows.rows)v[r.key]=r.value||"";
+  const v={}; for(const key of keys)v[key]=await getSetting(store.id,key,"");
   res.json({telebirr:v.payment_telebirr||"",telebirrEnabled:v.payment_telebirr_enabled==="1",telebirrLink:v.payment_telebirr_link||"",bank:v.payment_bank||"",bankEnabled:v.payment_bank_enabled==="1",bankLink:v.payment_bank_link||"",mastercardDetails:v.payment_mastercard_details||"",mastercardEnabled:v.payment_mastercard_enabled==="1",mastercardLink:v.payment_mastercard_link||""});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/settings/payment",auth,async(req,res)=>{
  try{
   const values={payment_telebirr:String(req.body.telebirr||"").trim(),payment_telebirr_enabled:req.body.telebirrEnabled?"1":"0",payment_telebirr_link:String(req.body.telebirrLink||"").trim(),payment_bank:String(req.body.bank||"").trim(),payment_bank_enabled:req.body.bankEnabled?"1":"0",payment_bank_link:String(req.body.bankLink||"").trim(),payment_mastercard_details:String(req.body.mastercardDetails||"").trim(),payment_mastercard_enabled:req.body.mastercardEnabled?"1":"0",payment_mastercard_link:String(req.body.mastercardLink||"").trim()};
-  for(const [key,value] of Object.entries(values)){const row=await one("SELECT value FROM settings WHERE key=?",[key]);if(row) await run("UPDATE settings SET value=? WHERE key=?",[value,key]); else await run("INSERT INTO settings(key,value) VALUES(?,?)",[key,value]);}
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  for(const [key,value] of Object.entries(values))await setSetting(store.id,key,value);
   res.json({ok:true,telebirr:values.payment_telebirr,telebirrEnabled:values.payment_telebirr_enabled==="1",telebirrLink:values.payment_telebirr_link,bank:values.payment_bank,bankEnabled:values.payment_bank_enabled==="1",bankLink:values.payment_bank_link,mastercardDetails:values.payment_mastercard_details,mastercardEnabled:values.payment_mastercard_enabled==="1",mastercardLink:values.payment_mastercard_link});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.post("/api/payment/start",async(req,res)=>{
  try{
   const method=String(req.body.method||"").toUpperCase();
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   const map={MASTERCARD:{enabled:"payment_mastercard_enabled",link:"payment_mastercard_link",name:"Mastercard"},TELEBIRR:{enabled:"payment_telebirr_enabled",link:"payment_telebirr_link",name:"Telebirr"},BANK:{enabled:"payment_bank_enabled",link:"payment_bank_link",name:"Bank transfer"}};
   const cfg=map[method]; if(!cfg)return res.status(400).json({error:"Choose Pay later or a configured payment method."});
-  const en=await one("SELECT value FROM settings WHERE key=?",[cfg.enabled]); if(String(en?.value||"")!=="1")return res.status(400).json({error:cfg.name+" is currently unavailable. Please choose Pay later or try another payment method."});
-  const link=await one("SELECT value FROM settings WHERE key=?",[cfg.link]);
+  const en={value:await getSetting(store.id,cfg.enabled,"0")}; if(String(en?.value||"")!=="1")return res.status(400).json({error:cfg.name+" is currently unavailable. Please choose Pay later or try another payment method."});
+  const link={value:await getSetting(store.id,cfg.link,"")};
   if(!String(link?.value||"").trim())return res.status(400).json({error:cfg.name+" is enabled but its payment gateway/link has not been configured yet. Ask the admin to finish payment setup."});
   res.json({ok:true,url:String(link.value).trim(),method});
  }catch(e){res.status(500).json({error:e.message})}
@@ -387,15 +499,10 @@ app.post("/api/customer/login",async(req,res)=>{
 });
 app.get("/api/customer/me",async(req,res)=>{try{const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});res.json({id:c.id,name:c.name,phone:c.phone,email:c.email,address:c.address});}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/customer/logout",async(req,res)=>{try{const token=customerFromRequest(req);if(token)await run("DELETE FROM customer_sessions WHERE token=?",[token]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message})}});
-app.post("/api/admin/login",(req,res)=>{
- const user=String(req.body.username||""),pass=String(req.body.password||"");
- if(user!==ADMIN_USER||pass!==ADMIN_PASS)return res.status(401).json({error:"Invalid admin username or password."});
- res.json({ok:true});
-});
-app.get("/api/products",async(req,res)=>{try{let r=await q("SELECT * FROM products ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/products",async(req,res)=>{try{const store=await getPublicStore(req);if(!store)return res.status(404).json({error:"Store not found."});let r=await q("SELECT * FROM products WHERE store_id=? ORDER BY id DESC",[store.id]);res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/products",auth,upload.any(),async(req,res)=>{
  try{
-  const p=req.body;if(!p.name||p.price===undefined)return res.status(400).json({error:"Name and price are required"});
+  const p=req.body; const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."}); if(!p.name||p.price===undefined)return res.status(400).json({error:"Name and price are required"});
   const files=Array.isArray(req.files)?req.files:[];
   const mainFile=files.find(f=>f.fieldname==="image");
   const image=await imgUrl(req,mainFile);
@@ -408,14 +515,15 @@ app.post("/api/products",auth,upload.any(),async(req,res)=>{
   for(const f of files.filter(f=>/^color_image_\d+$/.test(f.fieldname))){const m=f.fieldname.match(/^(?:color_image_)(\d+)$/);const idx=Number(m[1]);if(colors[idx])colorImages[colors[idx]]=await imgUrl(req,f);}
   const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
   if(!sizes.length || stock<1)return res.status(400).json({error:"Add at least one size and a quantity for that size."});
-  const vals=[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),JSON.stringify(colorImages),p.category||"Shoes",image];
-  if(usePg){const r=await pgPool.query("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,color_images,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",vals);return res.json({id:r.rows[0].id});}
-  const r=db.prepare("INSERT INTO products(name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,color_images,category,image) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(...vals);res.json({id:r.lastInsertRowid});
+  const vals=[store.id,p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),JSON.stringify(colorImages),p.category||"Shoes",image];
+  if(usePg){const r=await pgPool.query("INSERT INTO products(store_id,name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,color_images,category,image) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",vals);return res.json({id:r.rows[0].id});}
+  const r=db.prepare("INSERT INTO products(store_id,name,brand,price,old_price,sizes,stock,size_stock,colors,color_stock,color_images,category,image) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(...vals);res.json({id:r.lastInsertRowid});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.put("/api/products/:id",auth,upload.any(),async(req,res)=>{
  try{
-  const old=await one("SELECT * FROM products WHERE id=?",[req.params.id]);if(!old)return res.sendStatus(404);
+  const store=await getAdminStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  const old=await one("SELECT * FROM products WHERE id=? AND store_id=?",[req.params.id,store.id]);if(!old)return res.sendStatus(404);
   const p=req.body,files=Array.isArray(req.files)?req.files:[],mainFile=files.find(f=>f.fieldname==="image");
   const image=mainFile?await imgUrl(req,mainFile):old.image;
   const sizes=String(p.sizes||"").split(",").map(x=>x.trim()).filter(Boolean);
@@ -429,14 +537,15 @@ app.put("/api/products/:id",auth,upload.any(),async(req,res)=>{
   for(const c of colors) if(oldColorImages[c]) colorImages[c]=oldColorImages[c];
   for(const f of files.filter(f=>/^color_image_\d+$/.test(f.fieldname))){const m=f.fieldname.match(/^(?:color_image_)(\d+)$/);const idx=Number(m[1]);if(colors[idx])colorImages[colors[idx]]=await imgUrl(req,f);}
   const stock=Object.values(normalized).reduce((a,b)=>a+b,0);
-  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,size_stock=?,colors=?,color_stock=?,color_images=?,category=?,image=? WHERE id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),JSON.stringify(colorImages),p.category||"Shoes",image,req.params.id]);res.sendStatus(204);
+  await run("UPDATE products SET name=?,brand=?,price=?,old_price=?,sizes=?,stock=?,size_stock=?,colors=?,color_stock=?,color_images=?,category=?,image=? WHERE id=? AND store_id=?",[p.name,p.brand||"",+p.price,+p.old_price||null,sizes.join(","),stock,JSON.stringify(normalized),colors.join(","),JSON.stringify(normalizedColors),JSON.stringify(colorImages),p.category||"Shoes",image,req.params.id,store.id]);res.sendStatus(204);
  }catch(e){res.status(500).json({error:e.message})}
 });
-app.delete("/api/products/:id",auth,async(req,res)=>{await run("DELETE FROM products WHERE id=?",[req.params.id]);res.sendStatus(204)});
+app.delete("/api/products/:id",auth,async(req,res)=>{const store=await getAdminStore(req);if(!store)return res.status(404).json({error:"Store not found."});await run("DELETE FROM products WHERE id=? AND store_id=?",[req.params.id,store.id]);res.sendStatus(204)});
 
 app.post("/api/orders",async(req,res)=>{
  try{
   const {customer,phone,address,notes,items}=req.body;
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
   const signedCustomer=await getCustomer(req);
   const customerId=signedCustomer?signedCustomer.id:null;
   const paymentMethod=String(req.body.paymentMethod||"NONE").toUpperCase();
@@ -444,25 +553,25 @@ app.post("/api/orders",async(req,res)=>{
   if(!allowedPayments.includes(paymentMethod))return res.status(400).json({error:"Invalid payment method."});
   if(paymentMethod!=="NONE")return res.status(402).json({error:"This order can only be created after verified payment. The live gateway confirmation is not connected yet. Choose Pay later to place the order without payment."});
   if(!customer||!phone||!address||!Array.isArray(items)||!items.length)return res.status(400).json({error:"Please complete your name, phone, address and cart."});
-  const deliverySetting=await one("SELECT value FROM settings WHERE key=?",["delivery_fee"]);
+  const deliverySetting={value:await getSetting(store.id,"delivery_fee","0")};
   const deliveryFee=Math.max(0,Number(deliverySetting&&deliverySetting.value||0));
   const enteredCoupon=String(req.body.couponCode||"").trim().toUpperCase();
-  const couponCodeRow=await one("SELECT value FROM settings WHERE key=?",["coupon_code"]);
-  const couponPercentRow=await one("SELECT value FROM settings WHERE key=?",["coupon_percent"]);
+  const couponCodeRow={value:await getSetting(store.id,"coupon_code","")};
+  const couponPercentRow={value:await getSetting(store.id,"coupon_percent","0")};
   const configuredCoupon=String(couponCodeRow&&couponCodeRow.value||"").trim().toUpperCase();
   const configuredPercent=Math.min(100,Math.max(0,Number(couponPercentRow&&couponPercentRow.value||0)));
   const couponApplied=Boolean(enteredCoupon && configuredCoupon && enteredCoupon===configuredCoupon && configuredPercent>0);
   if(enteredCoupon && !couponApplied)return res.status(400).json({error:"Invalid or expired discount coupon."});
   let subtotal=0;
   for(const i of items){
-   const p=await one("SELECT price FROM products WHERE id=?",[i.id]);
+   const p=await one("SELECT price FROM products WHERE id=? AND store_id=?",[i.id,store.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
    subtotal += Number(p.price||0)*Number(i.qty||0);
   }
   const discount=couponApplied?subtotal*(configuredPercent/100):0;
   const total=Math.max(0,subtotal-discount+deliveryFee);
   for(const i of items){
-   const p=await one("SELECT stock,name,price,size_stock,colors,color_stock FROM products WHERE id=?",[i.id]);
+   const p=await one("SELECT stock,name,price,size_stock,colors,color_stock FROM products WHERE id=? AND store_id=?",[i.id,store.id]);
    if(!p)return res.status(409).json({error:"A product in your cart is no longer available."});
    let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
    const size=String(i.size||"").trim(), available=Object.prototype.hasOwnProperty.call(ss,size)?Number(ss[size]):0;
@@ -472,37 +581,39 @@ app.post("/api/orders",async(req,res)=>{
    if(colorList.length && (!color || colorAvailable<Number(i.qty)))return res.status(409).json({error:`Not enough stock for ${p.name} in color ${color||"selected color"}. Only ${Math.max(0,colorAvailable)} available.`});
   }
   let orderId;
-  if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",[customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod]);orderId=r.rows[0].id}
-  else orderId=db.prepare("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES(?,?,?,?,?,?,?,?)").run(customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod).lastInsertRowid;
+  if(usePg){const r=await pgPool.query("INSERT INTO orders(store_id,customer,phone,address,customer_id,notes,items,total,payment_method) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",[store.id,customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod]);orderId=r.rows[0].id}
+  else orderId=db.prepare("INSERT INTO orders(store_id,customer,phone,address,customer_id,notes,items,total,payment_method) VALUES(?,?,?,?,?,?,?,?,?)").run(store.id,customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod).lastInsertRowid;
   const smsItems=items.map(i=>`${i.qty}x ${i.name||"shoe"} (size ${i.size||"-"}${i.color?`, ${i.color}`:""})`).join("; ");
-  const smsText=`NEW YOUR OWN STORE ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
+  const smsText=`NEW ${store.name} ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
   // SMS is a notification only: if the provider is temporarily unavailable, the customer's order still succeeds.
-  await sendAdminSMS(smsText);
+  const storeAdmin=await one("SELECT phone FROM admins WHERE store_id=? AND phone<>? ORDER BY id ASC LIMIT 1",[store.id,""]);
+  await sendAdminSMS(smsText,storeAdmin?.phone||SMS_ADMIN_PHONE);
 
   let wa="";
   if(WHATSAPP){
    const lines=items.map(i=>`${i.qty}x ${i.name||"shoe"} size ${i.size||""}${i.color?` color ${i.color}`:""}`).join("\n");
-   wa=`https://wa.me/${WHATSAPP}?text=${encodeURIComponent(`Hello ${STORE_NAME}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${subtotal.toFixed(2)} ${CURRENCY}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${discount.toFixed(2)} ${CURRENCY}`:""}\nDelivery: ${deliveryFee.toFixed(2)} ${CURRENCY}\nTotal: ${total.toFixed(2)} ${CURRENCY}`)}`;
+   wa=`https://wa.me/${(await getSetting(store.id,"whatsapp",WHATSAPP)).replace(/\D/g,"")}?text=${encodeURIComponent(`Hello ${store.name}, I placed order #${orderId}.\nName: ${customer}\nPhone: ${phone}\nAddress: ${address}\nItems:\n${lines}\nSubtotal: ${subtotal.toFixed(2)} ${CURRENCY}${couponApplied?`\nCoupon: ${configuredCoupon} (-${configuredPercent}%)\nDiscount: ${discount.toFixed(2)} ${CURRENCY}`:""}\nDelivery: ${deliveryFee.toFixed(2)} ${CURRENCY}\nTotal: ${total.toFixed(2)} ${CURRENCY}`)}`;
   }
   let paymentUrl="";
-  if(paymentMethod==="MASTERCARD"){const row=await one("SELECT value FROM settings WHERE key=?",["payment_mastercard_link"]);paymentUrl=String(row&&row.value||"").trim();}
+  if(paymentMethod==="MASTERCARD"){paymentUrl=await getSetting(store.id,"payment_mastercard_link","");}
   res.json({orderId,whatsapp:wa,subtotal,discount,couponCode:couponApplied?configuredCoupon:"",couponPercent:couponApplied?configuredPercent:0,deliveryFee,total,paymentMethod,paymentUrl});
  }catch(e){res.status(500).json({error:e.message})}
 });
 app.get("/api/customer/orders",async(req,res)=>{
  try{
   const c=await getCustomer(req);if(!c)return res.status(401).json({error:"Not signed in."});
-  const r=await q("SELECT id,total,status,created_at,items,payment_method FROM orders WHERE customer_id=? ORDER BY created_at DESC,id DESC",[c.id]);
+  const store=await getPublicStore(req); if(!store)return res.status(404).json({error:"Store not found."});
+  const r=await q("SELECT id,total,status,created_at,items,payment_method FROM orders WHERE customer_id=? AND store_id=? ORDER BY created_at DESC,id DESC",[c.id,store.id]);
   res.json(r.rows);
  }catch(e){res.status(500).json({error:e.message})}
 });
-app.get("/api/orders/notification-count",async(req,res)=>{try{let r=await q("SELECT COUNT(*) AS n FROM orders WHERE status=? AND admin_seen=0",["NEW"]);res.json({count:Number(r.rows[0].n||0)})}catch(e){res.status(500).json({error:e.message})}});
-app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders ORDER BY id DESC");res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
-app.post("/api/orders/mark-seen",auth,async(req,res)=>{try{await run("UPDATE orders SET admin_seen=1 WHERE status=? AND admin_seen=0",["NEW"]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/orders/notification-count",auth,async(req,res)=>{try{let r=await q("SELECT COUNT(*) AS n FROM orders WHERE store_id=? AND status=? AND admin_seen=0",[req.admin.store_id,"NEW"]);res.json({count:Number(r.rows[0].n||0)})}catch(e){res.status(500).json({error:e.message})}});
+app.get("/api/orders",auth,async(req,res)=>{try{let r=await q("SELECT * FROM orders WHERE store_id=? ORDER BY id DESC",[req.admin.store_id]);res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/orders/mark-seen",auth,async(req,res)=>{try{await run("UPDATE orders SET admin_seen=1 WHERE store_id=? AND status=? AND admin_seen=0",[req.admin.store_id,"NEW"]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 app.patch("/api/orders/:id",auth,async(req,res)=>{
  try{
   const next=String(req.body.status||"").toUpperCase();
-  const order=await one("SELECT id,status,items FROM orders WHERE id=?",[req.params.id]);
+  const order=await one("SELECT id,status,items FROM orders WHERE id=? AND store_id=?",[req.params.id,req.admin.store_id]);
   if(!order)return res.status(404).json({error:"Order not found."});
   const current=String(order.status||"NEW").toUpperCase();
   if(next==="CONFIRMED" && current!=="CONFIRMED"){
@@ -510,7 +621,7 @@ app.patch("/api/orders/:id",auth,async(req,res)=>{
    if(!Array.isArray(items)||!items.length)return res.status(400).json({error:"This order has no items."});
    // Check every requested size again at confirmation time. Stock is reserved/decremented only here.
    for(const i of items){
-    const p=await one("SELECT name,size_stock,colors,color_stock FROM products WHERE id=?",[i.id]);
+    const p=await one("SELECT name,size_stock,colors,color_stock FROM products WHERE id=? AND store_id=?",[i.id,req.admin.store_id]);
     if(!p)return res.status(409).json({error:`Product #${i.id} is no longer available.`});
     let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){}
     const size=String(i.size||"").trim(), available=Number(ss[size]||0), wanted=Number(i.qty||0);
@@ -520,11 +631,11 @@ app.patch("/api/orders/:id",auth,async(req,res)=>{
     if(colorList.length && (!color || colorAvailable<wanted))return res.status(409).json({error:`Cannot confirm: ${p.name} color ${color||"selected color"} has only ${Math.max(0,colorAvailable)} available.`});
    }
    for(const i of items){
-    const p=await one("SELECT size_stock,color_stock FROM products WHERE id=?",[i.id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){} let cs={}; try{cs=JSON.parse(p.color_stock||"{}")}catch(e){}
+    const p=await one("SELECT size_stock,color_stock FROM products WHERE id=? AND store_id=?",[i.id,req.admin.store_id]); let ss={}; try{ss=JSON.parse(p.size_stock||"{}")}catch(e){} let cs={}; try{cs=JSON.parse(p.color_stock||"{}")}catch(e){}
     ss[i.size]=Math.max(0,Number(ss[i.size]||0)-Number(i.qty));
     if(i.color && Object.prototype.hasOwnProperty.call(cs,i.color)) cs[i.color]=Math.max(0,Number(cs[i.color]||0)-Number(i.qty));
     const remaining=Object.values(ss).reduce((a,b)=>a+Number(b||0),0);
-    await run("UPDATE products SET stock=?,size_stock=?,color_stock=? WHERE id=?",[remaining,JSON.stringify(ss),JSON.stringify(cs),i.id]);
+    await run("UPDATE products SET stock=?,size_stock=?,color_stock=? WHERE id=? AND store_id=?",[remaining,JSON.stringify(ss),JSON.stringify(cs),i.id,req.admin.store_id]);
    }
   }
   if(next==="DELIVERED" && current!=="CONFIRMED" && current!=="DELIVERED")return res.status(400).json({error:"Confirm the order before marking it delivered."});
