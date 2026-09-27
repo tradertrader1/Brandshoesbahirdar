@@ -9,7 +9,8 @@ const {v2:cloudinary}=require("cloudinary");
 
 const app=express();
 const PORT=process.env.PORT||3000;
-const STORE_NAME=process.env.STORE_NAME||"BRAND SHOES BAHIRDAR";
+const configuredStoreName=String(process.env.STORE_NAME||"").trim();
+const STORE_NAME=/^brand\s*shoes(?:\s+bahirdar)?$/i.test(configuredStoreName)?"YOUR OWN STORE":(configuredStoreName||"YOUR OWN STORE");
 const CURRENCY=process.env.CURRENCY||"ETB";
 const WHATSAPP=String(process.env.WHATSAPP_NUMBER||"251945306592").replace(/\D/g,"");
 const ADMIN_USER=process.env.ADMIN_USER||"admin";
@@ -464,7 +465,7 @@ app.post("/api/orders",async(req,res)=>{
   if(usePg){const r=await pgPool.query("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",[customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod]);orderId=r.rows[0].id}
   else orderId=db.prepare("INSERT INTO orders(customer,phone,address,customer_id,notes,items,total,payment_method) VALUES(?,?,?,?,?,?,?,?)").run(customer,phone,address,customerId,notes||"",JSON.stringify(items),total,paymentMethod).lastInsertRowid;
   const smsItems=items.map(i=>`${i.qty}x ${i.name||"shoe"} (size ${i.size||"-"}${i.color?`, ${i.color}`:""})`).join("; ");
-  const smsText=`NEW BRAND SHOES ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
+  const smsText=`NEW YOUR OWN STORE ORDER #${orderId}. Customer: ${customer}. Phone: ${phone}. Total: ${total.toFixed(2)} ${CURRENCY}. Items: ${smsItems}. Check Admin dashboard.`;
   // SMS is a notification only: if the provider is temporarily unavailable, the customer's order still succeeds.
   await sendAdminSMS(smsText);
 
