@@ -360,36 +360,22 @@ app.get("/api/config",async(req,res)=>{
 app.get("/api/admin/me",auth,async(req,res)=>{const name=(await one("SELECT name FROM stores WHERE id=?",[req.admin.store_id]))?.name||req.admin.store_name;res.json({id:req.admin.id,username:req.admin.username,fullName:req.admin.full_name,phone:req.admin.phone,storeId:req.admin.store_id,storeName:name,storeSlug:req.admin.store_slug,storeUrl:`${req.protocol}://${req.get("host")}/?store=${encodeURIComponent(req.admin.store_slug)}`,isMainAdmin:Number(req.admin.is_main_admin)===1,whatsapp:await getSetting(req.admin.store_id,"whatsapp",WHATSAPP),deliveryFee:Number(await getSetting(req.admin.store_id,"delivery_fee","0"))})});
 app.post("/api/admin/register",async(req,res)=>{
  try{
-  const body=req.body&&typeof req.body==="object"?req.body:{};
-  const fullName=String(body.fullName||"").trim(), username=String(body.username||"").trim(), phone=String(body.phone||"").trim(), storeName=String(body.storeName||"").trim(), password=String(body.password||"");
+  const fullName=String(req.body.fullName||"").trim(), username=String(req.body.username||"").trim(), phone=String(req.body.phone||"").trim(), storeName=String(req.body.storeName||"").trim(), password=String(req.body.password||"");
   if(fullName.length<2||username.length<3||storeName.length<2||password.length<6)return res.status(400).json({error:"Enter your name, store name, username and a password of at least 6 characters."});
   if(!/^[A-Za-z0-9_.-]+$/.test(username))return res.status(400).json({error:"Username may contain letters, numbers, dots, underscores and hyphens."});
   if(await one("SELECT id FROM admins WHERE username=?",[username]))return res.status(409).json({error:"That admin username is already in use."});
   const slug=await uniqueStoreSlug(storeName); let storeId;
-  if(usePg){
-   const client=await pgPool.connect();
-   try{
-    await client.query("BEGIN");
-    const sr=await client.query("INSERT INTO stores(name,slug) VALUES($1,$2) RETURNING id",[storeName,slug]);storeId=sr.rows[0].id;
-    const ph=makePasswordHash(password);
-    const ar=await client.query("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES($1,$2,$3,$4,$5,1,0) RETURNING id",[storeId,username,fullName,phone,ph]);
-    const defaults={whatsapp:WHATSAPP,delivery_fee:"0",coupon_code:"",coupon_percent:"0",payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
-    for(const [key,value] of Object.entries(defaults))await client.query("INSERT INTO store_settings(store_id,key,value) VALUES($1,$2,$3)",[storeId,key,String(value)]);
-    const token=adminToken();
-    await client.query("INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES($1,$2,CURRENT_TIMESTAMP + INTERVAL '30 days')",[token,ar.rows[0].id]);
-    await client.query("COMMIT");
-    return res.json({ok:true,token,admin:{id:ar.rows[0].id,username,fullName,phone,storeId,storeName,storeSlug:slug,storeUrl:`/?store=${encodeURIComponent(slug)}`,isMainAdmin:false}});
-   }catch(e){try{await client.query("ROLLBACK")}catch(_){} throw e;}finally{client.release();}
-  }
-  const storeResult=db.prepare("INSERT INTO stores(name,slug) VALUES(?,?)").run(storeName,slug);storeId=storeResult.lastInsertRowid;
-  const ph=makePasswordHash(password);
-  const adminId=db.prepare("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES(?,?,?,?,?,1,0)").run(storeId,username,fullName,phone,ph).lastInsertRowid;
+  if(usePg){const sr=await pgPool.query("INSERT INTO stores(name,slug) VALUES($1,$2) RETURNING id",[storeName,slug]);storeId=sr.rows[0].id;}
+  else storeId=db.prepare("INSERT INTO stores(name,slug) VALUES(?,?)").run(storeName,slug).lastInsertRowid;
+  const ph=makePasswordHash(password); let adminId;
+  if(usePg){const ar=await pgPool.query("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES($1,$2,$3,$4,$5,1,0) RETURNING id",[storeId,username,fullName,phone,ph]);adminId=ar.rows[0].id;}
+  else adminId=db.prepare("INSERT INTO admins(store_id,username,full_name,phone,password_hash,is_active,is_main_admin) VALUES(?,?,?,?,?,1,0)").run(storeId,username,fullName,phone,ph).lastInsertRowid;
   const defaults={whatsapp:WHATSAPP,delivery_fee:"0",coupon_code:"",coupon_percent:"0",payment_telebirr:"",payment_telebirr_enabled:"0",payment_telebirr_link:"",payment_bank:"",payment_bank_enabled:"0",payment_bank_link:"",payment_mastercard_details:"",payment_mastercard_enabled:"0",payment_mastercard_link:""};
-  const insertSetting=db.prepare("INSERT INTO store_settings(store_id,key,value) VALUES(?,?,?)");
-  const addDefaults=db.transaction(()=>{for(const [key,value] of Object.entries(defaults))insertSetting.run(storeId,key,String(value));});addDefaults();
-  const token=adminToken();db.prepare("INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))").run(token,adminId);
+  for(const [key,value] of Object.entries(defaults))await setSetting(storeId,key,value);
+  const token=adminToken();
+  await run(usePg?"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,CURRENT_TIMESTAMP + INTERVAL '30 days')":"INSERT INTO admin_sessions(token,admin_id,expires_at) VALUES(?,?,datetime('now','+30 days'))",[token,adminId]);
   res.json({ok:true,token,admin:{id:adminId,username,fullName,phone,storeId,storeName,storeSlug:slug,storeUrl:`/?store=${encodeURIComponent(slug)}`,isMainAdmin:false}});
- }catch(e){console.error("Admin registration failed:",e);res.status(500).json({error:"Could not create the admin account. "+String(e.message||e)})}
+ }catch(e){res.status(500).json({error:e.message})}
 });
 app.post("/api/admin/login",async(req,res)=>{
  try{
