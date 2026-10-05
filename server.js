@@ -193,8 +193,14 @@ async function ensureMultiStoreSchema(){
   if(usePg){await pgPool.query("INSERT INTO admins(store_id,username,full_name,password_hash,is_active,is_main_admin) VALUES($1,$2,$3,$4,1,1)",[store.id,ADMIN_USER,"Main Admin",ph]);}
   else db.prepare("INSERT INTO admins(store_id,username,full_name,password_hash,is_active,is_main_admin) VALUES(?,?,?,?,1,1)").run(store.id,ADMIN_USER,"Main Admin",ph);
  }else{
-  // Keep the Render-configured account as the single Main Admin.
-  await run("UPDATE admins SET is_main_admin=CASE WHEN username=? THEN 1 ELSE 0 END WHERE username=? OR is_main_admin=1",[ADMIN_USER,ADMIN_USER]);
+  // Keep the Render-configured account as the single Main Admin and keep its
+  // credentials synchronized with the Render environment variables. This is
+  // important when ADMIN_PASS or ADMIN_USER is changed after the database was
+  // already created; otherwise the login form would continue checking the old
+  // password stored in the database.
+  const passwordHash=makePasswordHash(ADMIN_PASS);
+  await run("UPDATE admins SET username=?, password_hash=?, is_active=1, is_main_admin=1 WHERE id=?",[ADMIN_USER,passwordHash,mainAdmin.id]);
+  await run("UPDATE admins SET is_main_admin=0 WHERE id<>?",[mainAdmin.id]);
  }
  // Give every new store sensible payment/settings defaults when it is created.
 }
